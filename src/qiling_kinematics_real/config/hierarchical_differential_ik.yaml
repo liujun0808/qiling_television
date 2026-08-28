@@ -1,0 +1,116 @@
+# Phase 0 frozen contract parameters.
+# This file is not consumed by the current differential_ik_node yet.
+# Values are initial MuJoCo settings; names, units and semantics are frozen.
+qiling_differential_ik:
+  ros__parameters:
+    contract_version: "phase0-v1"
+
+    control_rate_hz: 50.0
+    nominal_dt_sec: 0.02
+    min_control_dt_sec: 0.01
+    max_control_dt_sec: 0.04
+    control_stall_fault_sec: 0.10
+
+    target_frame: "base_link"
+    joint_state_topic: "/joint_states"
+    command_topic: "/human_lower_command"
+    left_target_topic: "/teleop/left_wrist_target"
+    right_target_topic: "/teleop/right_wrist_target"
+    left_mode_topic: "/teleop/left_control_mode"
+    right_mode_topic: "/teleop/right_control_mode"
+
+    target_timeout_sec: 0.25
+    joint_state_timeout_sec: 0.20
+
+    strict_position_priority: true
+    position_task_enabled: true
+    orientation_task_enabled: true
+    elbow_task_enabled: false
+
+    left_shoulder_reference_frame: "left_shoulder_pitch_link"
+    left_elbow_frame: "left_elbow_link"
+    left_wrist_frame: "LH_hand_base_link"
+    right_shoulder_reference_frame: "right_shoulder_pitch_link"
+    right_elbow_frame: "right_elbow_link"
+    right_wrist_frame: "RH_hand_base_link"
+
+    left_joint_names:
+      - "left_shoulder_pitch_joint"
+      - "left_shoulder_roll_joint"
+      - "left_shoulder_yaw_joint"
+      - "left_elbow_joint"
+      - "left_wrist_roll_joint"
+      - "left_wrist_pitch_joint"
+      - "left_wrist_yaw_joint"
+    right_joint_names:
+      - "right_shoulder_pitch_joint"
+      - "right_shoulder_roll_joint"
+      - "right_shoulder_yaw_joint"
+      - "right_elbow_joint"
+      - "right_wrist_roll_joint"
+      - "right_wrist_pitch_joint"
+      - "right_wrist_yaw_joint"
+
+    left_q_rest: [-0.45, 0.30, 0.02, -1.40, 1.40, 0.0, 0.0]
+    right_q_rest: [-0.45, -0.30, 0.02, -1.40, 1.40, 0.0, 0.0]
+
+    position_gain: 3.0
+    rotation_gain: 3.0
+    max_linear_velocity_mps: 0.20
+    max_angular_velocity_rps: 0.80
+    characteristic_length_m: 0.25
+
+    position_regularization: 0.0001
+    position_smoothness_weight: 0.001
+    orientation_regularization: 0.0001
+    orientation_smoothness_weight: 0.001
+
+    adaptive_damping_enabled: true
+    damping_min: 0.0001
+    damping_gain: 0.02
+    position_sigma_warn: 0.05
+    wrist_sigma_warn: 0.08
+    rank_threshold: 0.0001
+    singularity_speed_scale_min: 0.20
+
+    joint_limit_margin_rad: 0.08
+    joint_limit_damper_gain: 1.0
+    hard_limit_tolerance_rad: 0.005
+    max_joint_velocity_rps: [1.0, 1.0, 1.0, 1.2, 1.2, 1.2, 1.2]
+    max_joint_acceleration_rps2: [3.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0]
+
+    reference_mode: "bounded_integrator"
+    q_ref_gap_max_rad: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
+    q_ref_gap_fault_duration_sec: 0.50
+
+    max_orientation_position_degradation_mps: 0.0005
+    max_elbow_position_degradation_mps: 0.0005
+    max_elbow_orientation_degradation_rps: 0.002
+
+    elbow_outward_weight: 1.0
+    elbow_downward_weight: 0.30
+    elbow_home_weight: 0.80
+    elbow_direction_filter_alpha: 0.15
+    elbow_swivel_gain: 2.0
+    max_elbow_swivel_velocity_rps: 0.80
+    elbow_posture_weight: 0.10
+    elbow_joint_centering_weight: 0.05
+    elbow_smoothness_weight: 0.05
+    elbow_regularization: 0.0001
+    min_shoulder_wrist_distance_m: 0.05
+    min_elbow_projection_radius_m: 0.02
+    elbow_sigma_fade_start: 0.08
+    elbow_sigma_disable: 0.04
+
+    max_position_error_m: 0.25
+    max_rotation_error_rad: 1.20
+    divergence_fault_duration_sec: 0.50
+    consecutive_primary_qp_failures_to_fault: 3
+
+    command_kp: 40.0
+    command_kd: 2.0
+    qp_max_iter: 80
+    qp_eps_abs: 0.00001
+    qp_eps_rel: 0.00001
+    diagnostics_log_period_sec: 1.0
+

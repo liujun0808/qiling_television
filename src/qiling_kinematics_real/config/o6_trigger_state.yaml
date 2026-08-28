@@ -1,0 +1,15 @@
+qiling_o6_trigger_state:
+  ros__parameters:
+    joy_topic: "/xr/controller_joy"
+    # Internal state interface. The real O6 command adapter will subscribe
+    # here after its unified SDK command type is confirmed.
+    state_topic: "/teleop/o6_trigger_state"
+    home_complete_topic: "/teleop/startup_home_complete"
+    require_home_complete: true
+    left_trigger_axis: 0
+    right_trigger_axis: 1
+    close_threshold: 0.75
+    release_threshold: 0.25
+    debounce_sec: 0.08
+    joy_timeout_sec: 0.20
+    publish_rate_hz: 90.0

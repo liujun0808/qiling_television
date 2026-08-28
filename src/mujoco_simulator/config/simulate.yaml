@@ -1,0 +1,32 @@
+mujoco_simulator:
+    # MuJoCo 场景文件。使用 ROS package URI，避免依赖旧的
+    # robot_description/S4/mjcf 目录结构。
+    modelPath: "package://qi_robot_description/new_scene/scene_S4_40DOF_fullbody.xml"
+
+    # 仅用于日志显示，不再用于拼接模型路径。
+    modelName: "scene_S4_40DOF_fullbody"
+ 
+    # 电机状态与命令topic
+    lowStateTopic: "/human_lower_state" 
+    jointCommandsTopic: "/human_lower_command" 
+    qposTopic: "/mujoco/qpos"
+
+    # 加载模型后是否暂停
+    unPauseService: "/unpause_mujoco" # 启动服务名称
+    initPauseFlag: true # 1是会暂停,0是不会暂停
+
+    # 是否输出模型信息表格
+    modelTableFlag: true # 1是会,0是不会
+
+    # 第一阶段遥操仿真：固定 base_link，冻结 12 个腿关节。
+    # 模型仍保留原始 40 个 actuator，因此 /human_lower_command 接口不变；
+    # 腿部对应的前 12 个命令会在仿真端忽略。
+    fixedBase: true
+    freezeLegs: true
+
+    # Home 由 qiling_kinematics 唯一执行。MuJoCo 在收到首个外部命令前
+    # 只保持启动时的全零可驱动关节状态，不读取或重置 XML keyframe。
+    idleHoldKp: 40.0
+    idleHoldKd: 2.0
+    # Maximum change of the torque-like d.ctrl signal per second.
+    maxControlRateNmPerSec: 1000.0

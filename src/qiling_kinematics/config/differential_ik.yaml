@@ -1,0 +1,102 @@
+qiling_differential_ik:
+  ros__parameters:
+    control_rate_hz: 50.0
+    joint_state_topic: "/joint_states"
+    command_topic: "/human_lower_command"
+    left_target_topic: "/teleop/left_wrist_target"
+    right_target_topic: "/teleop/right_wrist_target"
+    left_mode_topic: "/teleop/left_control_mode"
+    right_mode_topic: "/teleop/right_control_mode"
+    left_state_topic: "/teleop/left_wrist_state"
+    right_state_topic: "/teleop/right_wrist_state"
+    target_frame: "base_link"
+    target_timeout_sec: 0.25
+    joint_state_timeout_sec: 0.20
+    min_control_dt_sec: 0.01
+    max_control_dt_sec: 0.04
+    control_stall_fault_sec: 0.10
+    target_filter_enabled: true
+    target_filter_time_constant_sec: 0.04
+    workspace_guard_enabled: true
+    workspace_guard_error_m: 0.03
+    workspace_guard_timeout_sec: 0.25
+    workspace_guard_limit_distance_rad: 0.003
+    workspace_guard_singularity_sigma: 0.003
+    # Phase 4.1: strict pose hierarchy plus feasible hard-limit/damper bounds.
+    orientation_task_enabled: true
+    position_gain: 3.0
+    max_linear_velocity_mps: 0.20
+    position_error_deadband_m: 0.003
+    position_sigma_slowdown_start: 0.05
+    position_sigma_stop: 0.003
+    position_singularity_speed_scale_min: 0.0
+    position_regularization: 0.0001
+    position_smoothness_weight: 0.001
+    rotation_gain: 3.0
+    max_angular_velocity_rps: 0.80
+    orientation_error_deadband_rad: 0.01
+    wrist_sigma_slowdown_start: 0.08
+    wrist_sigma_stop: 0.005
+    orientation_singularity_speed_scale_min: 0.0
+    orientation_regularization: 0.0001
+    orientation_smoothness_weight: 0.001
+    rank_threshold: 0.0001
+    characteristic_length_m: 0.25
+    position_sigma_warn: 0.05
+    wrist_sigma_warn: 0.08
+    max_orientation_position_degradation_mps: 0.0005
+    # Phase 5.2: one scalar elbow-swivel QP in the null-space of the complete
+    # 6D wrist task. It fades out before the wrist Jacobian becomes singular.
+    elbow_task_enabled: true
+    elbow_swivel_gain: 2.0
+    max_elbow_swivel_velocity_rps: 0.80
+    elbow_posture_weight: 0.08
+    elbow_joint_centering_weight: 0.03
+    elbow_smoothness_weight: 0.05
+    elbow_regularization: 0.0001
+    elbow_sigma_fade_start: 0.08
+    elbow_sigma_disable: 0.04
+    max_elbow_position_degradation_mps: 0.0005
+    max_elbow_orientation_degradation_rps: 0.002
+    log_pose_error: true
+    joint_limit_margin_rad: 0.08
+    joint_limit_damper_gain: 1.0
+    hard_limit_tolerance_rad: 0.005
+    # Requested home, in radians: [0, +/-10, 0, -90, 0, 0, 0] degrees.
+    left_q_rest: [0.0, 0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0]
+    right_q_rest: [0.0, -0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0]
+    # Initial candidate; collision validation in MuJoCo is required before real use.
+    left_home_transition_q: [1.00, 1.20, 0.0, -1.20, 0.0, 0.0, 0.0]
+    right_home_transition_q: [1.00, -1.20, 0.0, -1.20, 0.0, 0.0, 0.0]
+    # Phase 5.0/5.2: geometry is also used by the safe tertiary elbow task.
+    elbow_geometry_diagnostic_enabled: true
+    elbow_outward_weight: 1.0
+    elbow_downward_weight: 0.30
+    elbow_home_weight: 0.80
+    min_shoulder_wrist_distance_m: 0.05
+    min_elbow_projection_radius_m: 0.02
+    max_joint_velocity_rps: [1.0, 1.0, 1.0, 1.2, 1.2, 1.2, 1.2]
+    max_joint_acceleration_rps2: [3.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0]
+    consecutive_primary_qp_failures_to_fault: 3
+    log_state_transitions: true
+    diagnostics_log_period_ms: 2000
+    command_kp: 40.0
+    command_kd: 2.0
+    # Phase 6: Pinocchio gravity feedforward only. Friction and full inverse
+    # dynamics compensation are intentionally not enabled yet.
+    gravity_compensation_enabled: true
+    gravity_torque_scale: 1.0
+    gravity_torque_limit_scale: 1.0
+    startup_home_enabled: true
+    home_transition_duration_sec: 2.5
+    home_move_duration_sec: 3.0
+    home_settle_duration_sec: 0.30
+    home_transition_tolerance_rad: 0.08
+    home_tolerance_rad: 0.05
+    home_settle_timeout_sec: 4.0
+    home_log_period_ms: 1000
+    o6_home_hold_kp: 5.0
+    o6_home_hold_kd: 0.5
+    qp_max_iter: 80
+    qp_eps_abs: 0.00001
+    qp_eps_rel: 0.00001

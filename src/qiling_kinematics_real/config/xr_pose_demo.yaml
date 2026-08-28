@@ -1,0 +1,10 @@
+qiling_xr_pose_demo:
+  ros__parameters:
+    publish_rate_hz: 50.0
+    left_pose_topic: "/xr/left_controller_pose"
+    right_pose_topic: "/xr/right_controller_pose"
+    joy_topic: "/xr/controller_joy"
+    grip_start_sec: 2.0
+    grip_end_sec: 12.0
+    motion_amplitude_m: 0.06
+    motion_amplitude_rad: 0.25

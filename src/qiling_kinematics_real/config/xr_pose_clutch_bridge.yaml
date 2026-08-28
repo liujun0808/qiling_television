@@ -1,0 +1,62 @@
+qiling_xr_pose_clutch_bridge_real:
+  ros__parameters:
+    publish_rate_hz: 50.0
+    left_pose_topic: "/xr/left_controller_pose"
+    right_pose_topic: "/xr/right_controller_pose"
+    joy_topic: "/xr/controller_joy"
+    left_robot_state_topic: "/teleop/left_wrist_state"
+    right_robot_state_topic: "/teleop/right_wrist_state"
+    left_target_topic: "/teleop/left_wrist_target"
+    right_target_topic: "/teleop/right_wrist_target"
+    left_mode_topic: "/teleop/left_control_mode"
+    right_mode_topic: "/teleop/right_control_mode"
+    # Published mode values: 0=hold, 1=Grip active. Active control always
+    # tracks the complete 6D wrist pose.
+    target_frame: "base_link"
+
+    # The default demo and the XR adapter use the same button convention.
+    # Replace these indices if the Quest ROS/XR backend exposes another mapping.
+    left_grip_button: 4
+    right_grip_button: 5
+    # Use both the digital button and the analog Grip axes as a fallback.
+    left_grip_axis: 2
+    right_grip_axis: 3
+    grip_axis_threshold: 0.5
+    log_clutch_state: true
+
+    input_timeout_sec: 0.20
+    joy_timeout_sec: 0.20
+    robot_state_timeout_sec: 0.20
+    translation_scale: 1.0
+    # XRoboToolkit left-handed coordinates (X right, Y up, Z forward/in)
+    # -> ROS robot base coordinates (X forward, Y left, Z up).
+    # Matrix rows map [xr_x, xr_y, xr_z] to [robot_x, robot_y, robot_z].
+    xr_to_robot_m00: 0.0
+    xr_to_robot_m01: 0.0
+    xr_to_robot_m02: 1.0
+    xr_to_robot_m10: -1.0
+    xr_to_robot_m11: 0.0
+    xr_to_robot_m12: 0.0
+    xr_to_robot_m20: 0.0
+    xr_to_robot_m21: 1.0
+    xr_to_robot_m22: 0.0
+    # Measured with the current Quest stream: robot base X is reversed,
+    # while Y/Z are correct.
+    robot_translation_axis_sign_x: -1.0
+    robot_translation_axis_sign_y: 1.0
+    robot_translation_axis_sign_z: 1.0
+    # Current Quest 3 calibration: both controllers use the same base_link-Y sign.
+    left_robot_translation_axis_sign_y: 1.0
+    right_robot_translation_axis_sign_y: 1.0
+    # Suppress small controller position noise without disabling pose control.
+    translation_deadband_m: 0.015
+    # Current controller rotation direction is opposite to the robot target.
+    invert_relative_rotation: true
+    rotation_scale: 0.50
+    # Correct the remaining sign error measured around the robot base_link X
+    # axis; Y/Z use the existing convention.
+    robot_rotation_axis_sign_x: -1.0
+    robot_rotation_axis_sign_y: 1.0
+    robot_rotation_axis_sign_z: 1.0
+    max_relative_translation: 0.60
+    max_relative_rotation: 2.50
