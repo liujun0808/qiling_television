@@ -23,5 +23,5 @@ private:
     size_t expected_motor_count_{0};
     bool strict_command_size_{true};
     bool enable_state_bridge_{true};
-    bool enable_command_bridge_{false};
+    bool enable_command_bridge_{true};
 };

@@ -47,6 +47,41 @@ TEST(ArmControlState, GripReleaseResetsReferenceAndVelocity)
   EXPECT_TRUE(state.previousVelocity().isZero(0.0));
 }
 
+TEST(ArmControlState, HoldKeepsLatchedReference)
+{
+  ArmControlState state("left");
+  const ArmVector home = ArmVector::Constant(0.2);
+  state.initialize(home);
+
+  state.enterHold(home, false, "home reached");
+  const ArmVector drooped = ArmVector::Constant(0.35);
+  state.enterHold(drooped, false, "Grip released");
+
+  EXPECT_TRUE(state.reference().isApprox(home));
+  EXPECT_TRUE(state.previousVelocity().isZero(0.0));
+}
+
+TEST(ArmControlState, MeasuredStepUsesCurrentMeasurementEveryCycle)
+{
+  ArmControlState state("left");
+  ArmVector measured = ArmVector::Constant(0.5);
+  ArmVector q_min = ArmVector::Constant(-2.0);
+  ArmVector q_max = ArmVector::Constant(2.0);
+  ArmVector qdot = ArmVector::Constant(0.2);
+
+  state.initialize(measured);
+  state.updateGripRequest(true, measured);
+  ASSERT_TRUE(state.active());
+
+  ASSERT_TRUE(state.updateMeasuredStepReference(qdot, 0.1, measured, q_min, q_max));
+  EXPECT_TRUE(state.reference().isApprox(ArmVector::Constant(0.52)));
+
+  measured.setConstant(0.8);
+  ASSERT_TRUE(state.updateMeasuredStepReference(qdot, 0.1, measured, q_min, q_max));
+  EXPECT_TRUE(state.reference().isApprox(ArmVector::Constant(0.82)));
+  EXPECT_TRUE(state.previousVelocity().isApprox(qdot));
+}
+
 TEST(ArmControlState, TimeoutRequiresReleaseBeforeReactivation)
 {
   ArmControlState state("right");
@@ -97,4 +132,3 @@ TEST(ArmControlState, ConsecutiveFailuresLatchFault)
 }
 
 }  // namespace
-

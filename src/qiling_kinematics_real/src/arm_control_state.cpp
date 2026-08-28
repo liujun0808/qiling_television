@@ -42,8 +42,8 @@ void ArmControlState::updateGripRequest(bool pressed, const ArmVector & measured
       release_required_ = false;
       consecutive_solve_failures_ = 0;
       reason_ = "Grip released";
+      resetMotion(measured);
     }
-    resetMotion(measured);
     return;
   }
 
@@ -61,10 +61,16 @@ void ArmControlState::enterHold(
   if (!initialized_ || !measured.allFinite()) {
     return;
   }
+  const bool entering_hold = state_ != ArmRunState::Hold;
+  const bool newly_requiring_release = require_release && !release_required_;
   state_ = ArmRunState::Hold;
   release_required_ = release_required_ || require_release;
   reason_ = reason;
-  resetMotion(measured);
+  // Latch the hold target only when Hold is entered. Repeated calls from the
+  // control loop must not replace it with a gravity-displaced measurement.
+  if (entering_hold || newly_requiring_release) {
+    resetMotion(measured);
+  }
 }
 
 void ArmControlState::enterFault(const ArmVector & measured, const std::string & reason)
@@ -121,6 +127,37 @@ bool ArmControlState::integrateReference(
   return reference_.allFinite();
 }
 
+bool ArmControlState::updateMeasuredStepReference(
+  const ArmVector & qdot, double dt, const ArmVector & measured,
+  const ArmVector & q_min, const ArmVector & q_max)
+{
+  if (!initialized_ || state_ != ArmRunState::Active ||
+    !qdot.allFinite() || !measured.allFinite() ||
+    !q_min.allFinite() || !q_max.allFinite() ||
+    !std::isfinite(dt) || dt <= 0.0)
+  {
+    return false;
+  }
+
+  const ArmVector candidate = measured + dt * qdot;
+  if (!candidate.allFinite()) {
+    return false;
+  }
+
+  for (int i = 0; i < kSingleArmDof; ++i) {
+    if (q_min[i] > q_max[i] || candidate[i] < q_min[i] || candidate[i] > q_max[i]) {
+      return false;
+    }
+  }
+
+  // Real-robot mode deliberately does not accumulate a long-lived reference.
+  // Each command is one measured-state step, which prevents stale tracking
+  // error from integrating indefinitely when the hardware lags the target.
+  reference_ = candidate;
+  previous_velocity_ = qdot;
+  return true;
+}
+
 bool ArmControlState::initialized() const
 {
   return initialized_;
@@ -173,4 +210,3 @@ void ArmControlState::resetMotion(const ArmVector & measured)
 }
 
 }  // namespace qiling_kinematics
-

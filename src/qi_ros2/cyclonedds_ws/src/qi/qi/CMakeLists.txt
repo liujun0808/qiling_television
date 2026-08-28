@@ -18,6 +18,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/IMUState.msg"
   "msg/LowCmd.msg"
   "msg/LowState.msg"
+  "msg/HandCmd.msg"
+  "msg/HandsCmd.msg"
+  "msg/HandState.msg"
+  "msg/HandsState.msg"
 )
 
 rosidl_generate_dds_interfaces(

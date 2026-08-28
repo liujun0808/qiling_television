@@ -26,7 +26,9 @@ MitToQisnConverter::MitToQisnConverter() : Node("mit_to_qisn_converter")
         this->declare_parameter<int>("expected_motor_count", 26));
     strict_command_size_ = this->declare_parameter<bool>("strict_command_size", true);
     enable_state_bridge_ = this->declare_parameter<bool>("enable_state_bridge", true);
-    enable_command_bridge_ = this->declare_parameter<bool>("enable_command_bridge", false);
+    // The real-robot workflow uses this node as a bidirectional bridge by
+    // default: lowstate -> human_lower_state and human_lower_command -> lowcmd.
+    enable_command_bridge_ = this->declare_parameter<bool>("enable_command_bridge", true);
 
     // Initialize subscribers and publishers
     if (enable_command_bridge_) {

@@ -152,8 +152,18 @@ private:
     const bool fresh = left.valid && right.valid &&
       std::chrono::duration<double>(Clock::now() - joy_received_at).count() <= timeout;
     if (!fresh) {
-      left.valid = false;
-      right.valid = false;
+      // A lost Quest frame must not be interpreted as a release. Keep the
+      // last stable trigger state so the hand command adapter holds its last
+      // target position until a fresh, debounced input arrives.
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Quest controller input timed out; holding last O6 trigger state");
+      StateMsg message;
+      message.data = static_cast<std::uint8_t>(
+        (left_state_.stable_closed ? 0x01 : 0x00) |
+        (right_state_.stable_closed ? 0x02 : 0x00));
+      state_pub_->publish(message);
+      return;
     }
 
     const auto now = Clock::now();

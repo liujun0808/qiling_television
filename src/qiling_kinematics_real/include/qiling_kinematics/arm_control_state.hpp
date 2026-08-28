@@ -25,6 +25,9 @@ public:
   bool integrateReference(
     const ArmVector & qdot, double dt,
     const ArmVector & q_min, const ArmVector & q_max);
+  bool updateMeasuredStepReference(
+    const ArmVector & qdot, double dt, const ArmVector & measured,
+    const ArmVector & q_min, const ArmVector & q_max);
 
   bool initialized() const;
   bool active() const;
@@ -51,4 +54,3 @@ private:
 };
 
 }  // namespace qiling_kinematics
-

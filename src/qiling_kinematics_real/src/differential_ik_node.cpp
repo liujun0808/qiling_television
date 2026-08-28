@@ -39,6 +39,7 @@ constexpr int kArmDof = 14;
 constexpr int kSideCount = 2;
 constexpr int kLeftSide = 0;
 constexpr int kRightSide = 1;
+constexpr int kLegMotorCount = 12;
 constexpr int kBodyMotorCount = 26;
 constexpr int kCommandSize = kBodyMotorCount;
 constexpr int kLeftArmCommandOffset = 12;
@@ -492,6 +493,9 @@ private:
 
     const auto received_at = Clock::now();
     std::lock_guard<std::mutex> lock(state_mutex_);
+    for (int i = 0; i < kLegMotorCount; ++i) {
+      leg_q_state_[i] = positions[i];
+    }
     for (int i = 0; i < kSingleArmDof; ++i) {
       q_state_[kLeftSide][i] = positions[kLeftArmCommandOffset + i];
       q_state_[kRightSide][i] = positions[kRightArmCommandOffset + i];
@@ -926,8 +930,8 @@ private:
         result.position_condition_number, result.wrist_rank,
         result.wrist_sigma_min, result.wrist_condition_number);
     }
-    if (!control.integrateReference(
-        result.qdot, dt, position_input.q_min, position_input.q_max))
+    if (!control.updateMeasuredStepReference(
+        result.qdot, dt, measured, position_input.q_min, position_input.q_max))
     {
       control.enterFault(measured, "reference integration failed");
       diagnostics.command_held = true;
@@ -1037,11 +1041,13 @@ private:
       raw_dt > get_parameter("control_stall_fault_sec").as_double();
 
     std::array<ArmVector, kSideCount> q_snapshot;
+    std::array<double, kLegMotorCount> leg_q_snapshot;
     std::array<bool, kSideCount> state_received{};
     std::array<Clock::time_point, kSideCount> state_times{};
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       q_snapshot = q_state_;
+      leg_q_snapshot = leg_q_state_;
       state_received = arm_state_received_;
       state_times = last_arm_state_time_;
     }
@@ -1096,7 +1102,7 @@ private:
           for (auto & velocity : home_command_qdot_) {
             velocity.setZero();
           }
-          publishCommand(home_command_q_, home_command_qdot_);
+          publishCommand(leg_q_snapshot, home_command_q_, home_command_qdot_);
         }
         return;
       }
@@ -1104,7 +1110,7 @@ private:
         beginStartupHome(q_snapshot);
       }
       updateStartupHome(q_snapshot, dt);
-      publishCommand(home_command_q_, home_command_qdot_);
+      publishCommand(leg_q_snapshot, home_command_q_, home_command_qdot_);
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), get_parameter("home_log_period_ms").as_int(),
         "startup home phase=%s error=%.4f rad", toString(home_phase_),
@@ -1136,7 +1142,7 @@ private:
       control_stalled, dt, right_control_, *right_solver_, right_diagnostics_);
 
     if (left_control_.initialized() && right_control_.initialized()) {
-      publishCommand();
+      publishCommand(leg_q_snapshot);
     } else {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
@@ -1144,16 +1150,17 @@ private:
     }
   }
 
-  void publishCommand()
+  void publishCommand(const std::array<double, kLegMotorCount> & leg_positions)
   {
     const std::array<ArmVector, kSideCount> references = {
       left_control_.reference(), right_control_.reference()};
     const std::array<ArmVector, kSideCount> velocities = {
       ArmVector::Zero(), ArmVector::Zero()};
-    publishCommand(references, velocities);
+    publishCommand(leg_positions, references, velocities);
   }
 
   void publishCommand(
+    const std::array<double, kLegMotorCount> & leg_positions,
     const std::array<ArmVector, kSideCount> & references,
     const std::array<ArmVector, kSideCount> & velocities)
   {
@@ -1169,6 +1176,12 @@ private:
       joint.pos = 0.0F;
       joint.vel = 0.0F;
       joint.eff = 0.0F;
+    }
+
+    // Keep the legs at their measured positions. The arm-only controller must
+    // not turn the unused 0..11 command slots into a request for joint zero.
+    for (int i = 0; i < kLegMotorCount; ++i) {
+      command.commands[i].pos = static_cast<float>(leg_positions[i]);
     }
 
     for (int i = 0; i < kSingleArmDof; ++i) {
@@ -1245,6 +1258,7 @@ private:
 
   std::unique_ptr<DualArmKinematics> kinematics_;
   std::array<ArmVector, kSideCount> q_state_{};
+  std::array<double, kLegMotorCount> leg_q_state_{};
   std::array<ArmVector, kSideCount> q_min_{};
   std::array<ArmVector, kSideCount> q_max_{};
   std::array<ArmVector, kSideCount> home_q_{};

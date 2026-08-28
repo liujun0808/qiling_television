@@ -14,6 +14,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(mit_msgs REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(proxsuite REQUIRED)
+find_package(qi REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -53,6 +54,8 @@ add_executable(xr_pose_clutch_bridge_real src/xr_pose_clutch_bridge.cpp)
 add_executable(xr_pose_demo src/xr_pose_demo.cpp)
 add_executable(xrobotoolkit_pxrea_adapter_real src/xrobotoolkit_pxrea_adapter.cpp)
 add_executable(o6_trigger_state_node src/o6_trigger_state_node.cpp)
+add_executable(o6_command_adapter_node src/o6_command_adapter_node.cpp)
+add_executable(left_hand_test_node src/left_hand_test_node.cpp)
 
 ament_target_dependencies(differential_ik_real_node
   ament_index_cpp geometry_msgs mit_msgs rclcpp sensor_msgs std_msgs)
@@ -81,6 +84,14 @@ ament_target_dependencies(o6_trigger_state_node
   rclcpp sensor_msgs std_msgs)
 target_compile_features(o6_trigger_state_node PUBLIC cxx_std_17)
 
+ament_target_dependencies(o6_command_adapter_node
+  qi rclcpp std_msgs)
+target_compile_features(o6_command_adapter_node PUBLIC cxx_std_17)
+
+ament_target_dependencies(left_hand_test_node
+  qi rclcpp)
+target_compile_features(left_hand_test_node PUBLIC cxx_std_17)
+
 target_compile_features(differential_ik_real_node PUBLIC cxx_std_17)
 target_compile_features(pose_target_demo PUBLIC cxx_std_17)
 target_compile_features(xr_pose_clutch_bridge_real PUBLIC cxx_std_17)
@@ -94,6 +105,8 @@ install(TARGETS
   xr_pose_demo
   xrobotoolkit_pxrea_adapter_real
   o6_trigger_state_node
+  o6_command_adapter_node
+  left_hand_test_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(TARGETS qiling_dik_real_core

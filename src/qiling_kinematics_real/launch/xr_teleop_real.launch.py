@@ -40,4 +40,11 @@ def generate_launch_description():
             output="screen",
             parameters=[str(package_share / "config" / "o6_trigger_state.yaml")],
         ),
+        Node(
+            package="qiling_kinematics_real",
+            executable="o6_command_adapter_node",
+            name="qiling_o6_command_adapter",
+            output="screen",
+            parameters=[str(package_share / "config" / "o6_command_adapter.yaml")],
+        ),
     ])

@@ -1,0 +1,9 @@
+qiling_o6_command_adapter:
+  ros__parameters:
+    state_topic: "/teleop/o6_trigger_state"
+    command_topic: "/handscmd"
+    home_complete_topic: "/teleop/startup_home_complete"
+    require_home_complete: true
+    open_position: [255, 104, 255, 255, 255, 255]
+    close_position: [101, 60, 0, 0, 0, 0]
+    speed: 200
