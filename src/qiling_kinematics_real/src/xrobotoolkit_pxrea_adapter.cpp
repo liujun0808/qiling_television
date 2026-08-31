@@ -168,6 +168,9 @@ public:
     declare_parameter("input_frame", std::string("xr_origin"));
     declare_parameter("grip_button_threshold", 0.90);
     declare_parameter("frame_timeout_sec", 0.20);
+    declare_parameter("sdk_recovery_enabled", true);
+    declare_parameter("sdk_recovery_delay_sec", 0.50);
+    declare_parameter("sdk_state_watchdog_timeout_sec", 1.00);
 
     left_pose_pub_ = create_publisher<PoseMsg>(
       get_parameter("left_pose_topic").as_string(), rclcpp::QoS(1));
@@ -181,7 +184,10 @@ public:
       throw std::runtime_error(
               "PXREAInit failed; start /opt/apps/roboticsservice/runService.sh and connect Quest first");
     }
-    sdk_initialized_ = true;
+    {
+      std::lock_guard<std::mutex> lock(sdk_mutex_);
+      sdk_initialized_ = true;
+    }
 
     const double rate = std::max(get_parameter("publish_rate_hz").as_double(), 1.0);
     const auto period = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -195,7 +201,13 @@ public:
 
   ~XroboToolkitPxreaAdapter() override
   {
-    if (sdk_initialized_) {
+    bool sdk_initialized = false;
+    {
+      std::lock_guard<std::mutex> lock(sdk_mutex_);
+      sdk_initialized = sdk_initialized_;
+      sdk_initialized_ = false;
+    }
+    if (sdk_initialized) {
       PXREADeinit();
     }
   }
@@ -212,13 +224,27 @@ private:
   void handleSdkCallback(PXREAClientCallbackType type, int status, void * user_data)
   {
     if (type == PXREAServerConnect) {
+      {
+        std::lock_guard<std::mutex> lock(sdk_mutex_);
+        server_connected_ = true;
+        connected_at_ = Clock::now();
+        have_state_since_connection_ = false;
+      }
       RCLCPP_INFO(get_logger(), "XRoboToolkit PC Service connected");
       return;
     }
     if (type == PXREAServerDisconnect) {
       RCLCPP_WARN(get_logger(), "XRoboToolkit PC Service disconnected");
-      std::lock_guard<std::mutex> lock(mutex_);
-      frame_.valid = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        frame_.valid = false;
+      }
+      {
+        std::lock_guard<std::mutex> lock(sdk_mutex_);
+        server_connected_ = false;
+        have_state_since_connection_ = false;
+      }
+      requestSdkRecovery("server disconnect");
       return;
     }
     if (type != PXREADeviceStateJson || user_data == nullptr) {
@@ -250,15 +276,27 @@ private:
       next.received_at = Clock::now();
       next.valid = true;
 
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (left_valid) {
-        frame_.left = next.left;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (left_valid) {
+          frame_.left = next.left;
+        }
+        if (right_valid) {
+          frame_.right = next.right;
+        }
+        frame_.received_at = next.received_at;
+        frame_.valid = true;
       }
-      if (right_valid) {
-        frame_.right = next.right;
+
+      {
+        std::lock_guard<std::mutex> lock(sdk_mutex_);
+        server_connected_ = true;
+        have_state_since_connection_ = true;
+        last_state_received_at_ = next.received_at;
+        // A recovered state frame proves that the stream is alive again.  In
+        // that case cancel a pending process restart.
+        recovery_pending_ = false;
       }
-      frame_.received_at = next.received_at;
-      frame_.valid = true;
     } catch (const std::exception & error) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
@@ -268,6 +306,8 @@ private:
 
   void publishTick()
   {
+    maybeRecoverSdk();
+
     FrameState frame;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -304,9 +344,94 @@ private:
     joy_pub_->publish(joy);
   }
 
+  void requestSdkRecovery(const char * reason)
+  {
+    if (!get_parameter("sdk_recovery_enabled").as_bool()) {
+      return;
+    }
+
+    const auto now = Clock::now();
+    const auto delay = std::chrono::duration_cast<Clock::duration>(
+      std::chrono::duration<double>(
+        std::max(get_parameter("sdk_recovery_delay_sec").as_double(), 0.0)));
+    bool newly_requested = false;
+    {
+      std::lock_guard<std::mutex> lock(sdk_mutex_);
+      newly_requested = !recovery_pending_;
+      recovery_pending_ = true;
+      recovery_not_before_ = std::max(recovery_not_before_, now + delay);
+    }
+    if (newly_requested) {
+      RCLCPP_WARN(
+        get_logger(), "Scheduling PXREA client recovery: %s", reason);
+    }
+  }
+
+  void maybeRecoverSdk()
+  {
+    if (!get_parameter("sdk_recovery_enabled").as_bool()) {
+      return;
+    }
+
+    const auto now = Clock::now();
+    bool should_restart_process = false;
+    bool watchdog_request = false;
+    {
+      std::lock_guard<std::mutex> lock(sdk_mutex_);
+      // Do not restart merely because the adapter has not received its first
+      // frame.  Quest may be connected a little later, and the PXREA SDK
+      // does not tolerate a Deinit/Init cycle during its startup handshake.
+      // Recovery is armed by an explicit server disconnect, or by a stream
+      // that was working and then became stale.
+      if (!recovery_pending_ && server_connected_ && have_state_since_connection_) {
+        const double state_age =
+          std::chrono::duration<double>(now - last_state_received_at_).count();
+        const double timeout =
+          get_parameter("sdk_state_watchdog_timeout_sec").as_double();
+        if (state_age > std::max(timeout, 0.0)) {
+          recovery_pending_ = true;
+          recovery_not_before_ = now;
+          watchdog_request = true;
+        }
+      }
+
+      if (recovery_pending_ && now >= recovery_not_before_) {
+        recovery_pending_ = false;
+        // The SDK owns its callback/client threads.  Re-entering
+        // PXREADeinit/PXREAInit from this ROS timer can abort inside the SDK.
+        // Let the process end and let ROS launch respawn a clean client.
+        sdk_initialized_ = false;
+        should_restart_process = true;
+      }
+    }
+
+    if (watchdog_request) {
+      RCLCPP_WARN(
+        get_logger(), "No fresh PXREA controller state received; scheduling client recovery");
+    }
+    if (!should_restart_process) {
+      return;
+    }
+
+    RCLCPP_ERROR(
+      get_logger(),
+      "PXREA state stream is unavailable; stopping this adapter for a clean ROS respawn");
+    // Mark the SDK as no longer owned by this object.  The process is about
+    // to exit and the next respawn will create a fresh PXREA client.  This is
+    // intentional: calling PXREADeinit here races the SDK callback thread.
+    rclcpp::shutdown();
+  }
+
   std::mutex mutex_;
   FrameState frame_;
+  std::mutex sdk_mutex_;
   bool sdk_initialized_{false};
+  bool server_connected_{false};
+  bool have_state_since_connection_{false};
+  bool recovery_pending_{false};
+  Clock::time_point connected_at_{};
+  Clock::time_point last_state_received_at_{};
+  Clock::time_point recovery_not_before_{};
 
   rclcpp::Publisher<PoseMsg>::SharedPtr left_pose_pub_;
   rclcpp::Publisher<PoseMsg>::SharedPtr right_pose_pub_;

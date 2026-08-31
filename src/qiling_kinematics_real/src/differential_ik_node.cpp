@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -297,6 +298,7 @@ private:
 
     declare_parameter("command_kp", 40.0);
     declare_parameter("command_kd", 2.0);
+    declare_parameter("max_reference_tracking_error_rad", 0.35);
     declare_parameter("qp_max_iter", 80);
     declare_parameter("qp_eps_abs", 1e-5);
     declare_parameter("qp_eps_rel", 1e-5);
@@ -469,6 +471,165 @@ private:
   {
     filtered_target_valid_[side] = false;
     workspace_guard_[side].bad_duration_sec = 0.0;
+  }
+
+  std::string formatArmVector(const ArmVector & values) const
+  {
+    std::ostringstream stream;
+    stream << "[";
+    for (int i = 0; i < kSingleArmDof; ++i) {
+      if (i != 0) {
+        stream << ", ";
+      }
+      stream << values[i];
+    }
+    stream << "]";
+    return stream.str();
+  }
+
+  void logInvalidBounds(
+    int side,
+    const char * side_name,
+    const ArmVector & measured,
+    const ArmVector & q_min,
+    const ArmVector & q_max,
+    const HierarchicalDIKSolver::Result & result,
+    double dt)
+  {
+    const ArmSide arm_side = side == kLeftSide ? ArmSide::Left : ArmSide::Right;
+    const auto & joint_names = kinematics_->jointNames(arm_side);
+    int bad_joint = -1;
+    const char * reason = "no direct measured-position violation";
+
+    for (int i = 0; i < kSingleArmDof; ++i) {
+      if (!std::isfinite(q_min[i]) || !std::isfinite(q_max[i]) || q_min[i] > q_max[i]) {
+        bad_joint = i;
+        reason = "invalid configured/URDF position bounds";
+        break;
+      }
+      if (!std::isfinite(measured[i]) || measured[i] < q_min[i] || measured[i] > q_max[i]) {
+        bad_joint = i;
+        reason = "measured position outside URDF position bounds";
+        break;
+      }
+    }
+
+    if (bad_joint >= 0) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "%s position-primary INVALID_BOUNDS: %s; joint=%s[%d] "
+        "q_measured=%.9f urdf_range=[%.9f, %.9f] dt=%.6f "
+        "min_hard_limit_distance=%.9f qdot=%s",
+        side_name, reason, joint_names[bad_joint].c_str(), bad_joint,
+        measured[bad_joint], q_min[bad_joint], q_max[bad_joint], dt,
+        result.min_hard_limit_distance_rad, formatArmVector(result.qdot).c_str());
+      return;
+    }
+
+    // INVALID_BOUNDS can also be caused by an infeasible velocity-bound
+    // intersection even when the measured position itself is inside the
+    // configured hard limits. Print all vectors so that case is distinguishable
+    // from an actual URDF/SDK joint mapping problem.
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "%s position-primary INVALID_BOUNDS: %s; dt=%.6f "
+      "min_hard_limit_distance=%.9f q_measured=%s q_min=%s q_max=%s qdot=%s",
+      side_name, reason, dt, result.min_hard_limit_distance_rad,
+      formatArmVector(measured).c_str(), formatArmVector(q_min).c_str(),
+      formatArmVector(q_max).c_str(), formatArmVector(result.qdot).c_str());
+  }
+
+  void logReferenceIntegrationFailure(
+    int side,
+    const char * side_name,
+    const ArmControlState & control,
+    const ArmVector & qdot,
+    double dt,
+    const ArmVector & measured,
+    const ArmVector & q_min,
+    const ArmVector & q_max,
+    double max_tracking_error)
+  {
+    const ArmSide arm_side = side == kLeftSide ? ArmSide::Left : ArmSide::Right;
+    const auto & joint_names = kinematics_->jointNames(arm_side);
+    const ArmVector & reference = control.reference();
+
+    if (!control.initialized() || control.state() != ArmRunState::Active) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "%s reference integration rejected: invalid control state initialized=%s "
+        "state=%s dt=%.6f q_measured=%s q_ref=%s qdot=%s",
+        side_name, control.initialized() ? "true" : "false",
+        qiling_kinematics::toString(control.state()), dt,
+        formatArmVector(measured).c_str(), formatArmVector(reference).c_str(),
+        formatArmVector(qdot).c_str());
+      return;
+    }
+
+    const char * scalar_reason = nullptr;
+    if (!qdot.allFinite()) {
+      scalar_reason = "qdot contains non-finite values";
+    } else if (!measured.allFinite()) {
+      scalar_reason = "measured position contains non-finite values";
+    } else if (!q_min.allFinite() || !q_max.allFinite()) {
+      scalar_reason = "configured/URDF bounds contain non-finite values";
+    } else if (!std::isfinite(dt) || dt <= 0.0) {
+      scalar_reason = "invalid control dt";
+    } else if (!std::isfinite(max_tracking_error) || max_tracking_error < 0.0) {
+      scalar_reason = "invalid max tracking error";
+    }
+
+    if (scalar_reason != nullptr) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "%s reference integration rejected: reason=%s dt=%.9f "
+        "max_tracking_error=%.9f q_measured=%s q_ref=%s qdot=%s q_min=%s q_max=%s",
+        side_name, scalar_reason, dt, max_tracking_error,
+        formatArmVector(measured).c_str(), formatArmVector(reference).c_str(),
+        formatArmVector(qdot).c_str(), formatArmVector(q_min).c_str(),
+        formatArmVector(q_max).c_str());
+      return;
+    }
+
+    for (int i = 0; i < kSingleArmDof; ++i) {
+      const double integrated = reference[i] + dt * qdot[i];
+      const double tracking_min = std::max(q_min[i], measured[i] - max_tracking_error);
+      const double tracking_max = std::min(q_max[i], measured[i] + max_tracking_error);
+      const char * reason = nullptr;
+      if (q_min[i] > q_max[i]) {
+        reason = "lower bound is greater than upper bound";
+      } else if (measured[i] < q_min[i] || measured[i] > q_max[i]) {
+        reason = "measured position outside URDF position bounds";
+      } else if (!std::isfinite(reference[i])) {
+        reason = "previous reference is non-finite";
+      } else if (!std::isfinite(integrated)) {
+        reason = "q_measured + qdot * dt is non-finite";
+      } else if (tracking_min > tracking_max) {
+        reason = "measured tracking interval has no intersection with URDF bounds";
+      }
+
+      if (reason != nullptr) {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "%s reference integration rejected: reason=%s; joint=%s[%d] "
+          "q_measured=%.9f urdf_range=[%.9f, %.9f] q_ref=%.9f "
+          "qdot=%.9f q_integrated=%.9f tracking_range=[%.9f, %.9f] "
+          "dt=%.9f max_tracking_error=%.9f",
+          side_name, reason, joint_names[i].c_str(), i, measured[i],
+          q_min[i], q_max[i], reference[i], qdot[i], integrated,
+          tracking_min, tracking_max, dt, max_tracking_error);
+        return;
+      }
+    }
+
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "%s reference integration rejected: no single-joint cause identified; "
+      "q_measured=%s q_ref=%s qdot=%s q_min=%s q_max=%s dt=%.9f "
+      "max_tracking_error=%.9f",
+      side_name, formatArmVector(measured).c_str(), formatArmVector(reference).c_str(),
+      formatArmVector(qdot).c_str(), formatArmVector(q_min).c_str(),
+      formatArmVector(q_max).c_str(), dt, max_tracking_error);
   }
 
   void lowerStateCallback(const mit_msgs::msg::MITLowState::SharedPtr message)
@@ -874,6 +1035,10 @@ private:
     diagnostics.qdot = result.qdot;
 
     if (!result.success) {
+      if (result.status == SolverStatus::InvalidBounds) {
+        logInvalidBounds(
+          side, side_name, measured, position_input.q_min, position_input.q_max, result, dt);
+      }
       control.recordSolveFailure(
         measured,
         get_parameter("consecutive_primary_qp_failures_to_fault").as_int(),
@@ -930,9 +1095,15 @@ private:
         result.position_condition_number, result.wrist_rank,
         result.wrist_sigma_min, result.wrist_condition_number);
     }
-    if (!control.updateMeasuredStepReference(
-        result.qdot, dt, measured, position_input.q_min, position_input.q_max))
+    const double max_tracking_error =
+      get_parameter("max_reference_tracking_error_rad").as_double();
+    if (!control.integrateReference(
+        result.qdot, dt, measured, position_input.q_min, position_input.q_max,
+        max_tracking_error))
     {
+      logReferenceIntegrationFailure(
+        side, side_name, control, result.qdot, dt, measured,
+        position_input.q_min, position_input.q_max, max_tracking_error);
       control.enterFault(measured, "reference integration failed");
       diagnostics.command_held = true;
       finishArmCycle(side_name, previous_state, control, diagnostics);
@@ -1210,10 +1381,21 @@ private:
   double gravityFeedforward(int side, int joint) const
   {
     if (!get_parameter("gravity_compensation_enabled").as_bool() ||
-      side < 0 || side >= kSideCount || joint < 0 || joint >= kSingleArmDof)
+      !home_complete_ || side < 0 || side >= kSideCount ||
+      joint < 0 || joint >= kSingleArmDof)
     {
       return 0.0;
     }
+
+    // A Fault must never fall through to torque-only gravity control. In
+    // Fault, the startup path may intentionally use the measured position as
+    // its command, which leaves no Kp position error to oppose a bad or
+    // unvalidated gravity torque direction.
+    const ArmControlState & control = side == kLeftSide ? left_control_ : right_control_;
+    if (control.state() == ArmRunState::Fault) {
+      return 0.0;
+    }
+
     const double scale = get_parameter("gravity_torque_scale").as_double();
     const double limit_scale = get_parameter("gravity_torque_limit_scale").as_double();
     const double effort_limit = effort_limits_[side][joint];

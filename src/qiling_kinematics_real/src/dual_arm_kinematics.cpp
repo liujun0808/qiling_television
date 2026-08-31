@@ -122,9 +122,7 @@ std::array<ArmVector, 2> DualArmKinematics::gravityTorques(
   const ArmVector & left_q, const ArmVector & right_q)
 {
   q_ = makeConfiguration(left_q, right_q);
-  const Eigen::VectorXd zero_velocity = Eigen::VectorXd::Zero(model_.nv);
-  const Eigen::VectorXd zero_acceleration = Eigen::VectorXd::Zero(model_.nv);
-  pinocchio::rnea(model_, data_, q_, zero_velocity, zero_acceleration);
+  pinocchio::computeGeneralizedGravity(model_, data_, q_);
 
   std::array<ArmVector, 2> result;
   for (int side = 0; side < 2; ++side) {

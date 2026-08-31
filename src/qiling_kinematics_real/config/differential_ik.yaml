@@ -85,6 +85,10 @@ qiling_differential_ik_real:
     diagnostics_log_period_ms: 2000
     command_kp: 40.0
     command_kd: 2.0
+    # Active reference integrates the IK velocity, but never leads the
+    # measured joint state by more than this amount. This preserves restoring
+    # position torque without allowing an untracked reference to run away.
+    max_reference_tracking_error_rad: 0.35
     # Phase 6: Pinocchio gravity feedforward only. Friction and full inverse
     # dynamics compensation are intentionally not enabled yet.
     gravity_compensation_enabled: true

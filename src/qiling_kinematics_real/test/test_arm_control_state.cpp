@@ -21,12 +21,12 @@ TEST(ArmControlState, HoldNeverIntegrates)
   const ArmVector qdot = ArmVector::Ones();
   const ArmVector q_min = ArmVector::Constant(-2.0);
   const ArmVector q_max = ArmVector::Constant(2.0);
-  EXPECT_FALSE(state.integrateReference(qdot, 0.02, q_min, q_max));
+  EXPECT_FALSE(state.integrateReference(qdot, 0.02, measured, q_min, q_max, 0.35));
   EXPECT_TRUE(state.reference().isApprox(measured));
   EXPECT_TRUE(state.previousVelocity().isZero(0.0));
 }
 
-TEST(ArmControlState, GripReleaseResetsReferenceAndVelocity)
+TEST(ArmControlState, GripReleasePreservesReferenceAndResetsVelocity)
 {
   ArmControlState state("left");
   const ArmVector measured = ArmVector::Zero();
@@ -37,12 +37,38 @@ TEST(ArmControlState, GripReleaseResetsReferenceAndVelocity)
   const ArmVector qdot = ArmVector::Constant(0.5);
   const ArmVector q_min = ArmVector::Constant(-2.0);
   const ArmVector q_max = ArmVector::Constant(2.0);
-  ASSERT_TRUE(state.integrateReference(qdot, 0.02, q_min, q_max));
+  ASSERT_TRUE(state.integrateReference(qdot, 0.02, measured, q_min, q_max, 0.35));
   EXPECT_FALSE(state.reference().isZero(0.0));
 
   const ArmVector released_measured = ArmVector::Constant(0.1);
   state.updateGripRequest(false, released_measured);
   EXPECT_EQ(state.state(), ArmRunState::Hold);
+  const ArmVector held_reference = ArmVector::Constant(0.01);
+  EXPECT_TRUE(state.reference().isApprox(held_reference));
+  EXPECT_TRUE(state.previousVelocity().isZero(0.0));
+
+  state.updateGripRequest(true, released_measured);
+  EXPECT_EQ(state.state(), ArmRunState::Active);
+  EXPECT_TRUE(state.reference().isApprox(held_reference));
+  EXPECT_TRUE(state.previousVelocity().isZero(0.0));
+}
+
+TEST(ArmControlState, FaultReleaseResynchronizesReference)
+{
+  ArmControlState state("left");
+  const ArmVector measured = ArmVector::Zero();
+  state.initialize(measured);
+  state.updateGripRequest(true, measured);
+  ASSERT_TRUE(state.active());
+
+  const ArmVector fault_measured = ArmVector::Constant(0.2);
+  state.enterFault(fault_measured, "reference integration failed");
+  ASSERT_EQ(state.state(), ArmRunState::Fault);
+
+  const ArmVector released_measured = ArmVector::Constant(0.3);
+  state.updateGripRequest(false, released_measured);
+  EXPECT_EQ(state.state(), ArmRunState::Hold);
+  EXPECT_FALSE(state.releaseRequired());
   EXPECT_TRUE(state.reference().isApprox(released_measured));
   EXPECT_TRUE(state.previousVelocity().isZero(0.0));
 }
@@ -61,7 +87,7 @@ TEST(ArmControlState, HoldKeepsLatchedReference)
   EXPECT_TRUE(state.previousVelocity().isZero(0.0));
 }
 
-TEST(ArmControlState, MeasuredStepUsesCurrentMeasurementEveryCycle)
+TEST(ArmControlState, ActiveReferenceAccumulatesWithMeasuredTrackingBound)
 {
   ArmControlState state("left");
   ArmVector measured = ArmVector::Constant(0.5);
@@ -73,13 +99,31 @@ TEST(ArmControlState, MeasuredStepUsesCurrentMeasurementEveryCycle)
   state.updateGripRequest(true, measured);
   ASSERT_TRUE(state.active());
 
-  ASSERT_TRUE(state.updateMeasuredStepReference(qdot, 0.1, measured, q_min, q_max));
+  ASSERT_TRUE(state.integrateReference(qdot, 0.1, measured, q_min, q_max, 0.35));
   EXPECT_TRUE(state.reference().isApprox(ArmVector::Constant(0.52)));
 
-  measured.setConstant(0.8);
-  ASSERT_TRUE(state.updateMeasuredStepReference(qdot, 0.1, measured, q_min, q_max));
-  EXPECT_TRUE(state.reference().isApprox(ArmVector::Constant(0.82)));
+  ASSERT_TRUE(state.integrateReference(qdot, 0.1, measured, q_min, q_max, 0.35));
+  EXPECT_TRUE(state.reference().isApprox(ArmVector::Constant(0.54)));
   EXPECT_TRUE(state.previousVelocity().isApprox(qdot));
+}
+
+TEST(ArmControlState, ActiveReferenceIsBoundedRelativeToMeasuredState)
+{
+  ArmControlState state("left");
+  const ArmVector measured = ArmVector::Zero();
+  const ArmVector q_min = ArmVector::Constant(-2.0);
+  const ArmVector q_max = ArmVector::Constant(2.0);
+  const ArmVector qdot = ArmVector::Ones();
+
+  state.initialize(measured);
+  state.updateGripRequest(true, measured);
+  ASSERT_TRUE(state.active());
+
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_TRUE(state.integrateReference(qdot, 0.02, measured, q_min, q_max, 0.35));
+  }
+  EXPECT_TRUE((state.reference().array() <= 0.35 + 1.0e-12).all());
+  EXPECT_TRUE((state.reference().array() >= -1.0e-12).all());
 }
 
 TEST(ArmControlState, TimeoutRequiresReleaseBeforeReactivation)

@@ -158,6 +158,7 @@ TEST(DualArmKinematicsTest, ComputesFiniteGravityFeedforwardInJointOrder)
   for (int side = 0; side < 2; ++side) {
     EXPECT_TRUE(gravity[side].allFinite());
     EXPECT_TRUE((limits[side].array() > 0.0).all());
+    EXPECT_GT(gravity[side].cwiseAbs().maxCoeff(), 0.5);
   }
 }
 

@@ -37,12 +37,22 @@ void ArmControlState::updateGripRequest(bool pressed, const ArmVector & measured
   grip_pressed_ = pressed;
 
   if (!pressed) {
-    if (state_ == ArmRunState::Fault || release_required_ || falling_edge) {
+    if (state_ == ArmRunState::Fault || release_required_) {
       state_ = ArmRunState::Hold;
       release_required_ = false;
       consecutive_solve_failures_ = 0;
       reason_ = "Grip released";
+      // A fault/recovery transition must re-synchronize with the measured
+      // state before accepting another active command.
       resetMotion(measured);
+    } else if (falling_edge) {
+      state_ = ArmRunState::Hold;
+      consecutive_solve_failures_ = 0;
+      reason_ = "Grip released";
+      // Keep the last active reference so releasing the grip does not send a
+      // measured-position step to the robot. The velocity history is cleared
+      // because the next active solve starts from a stopped command state.
+      previous_velocity_.setZero();
     }
     return;
   }
@@ -51,7 +61,9 @@ void ArmControlState::updateGripRequest(bool pressed, const ArmVector & measured
     state_ = ArmRunState::Active;
     consecutive_solve_failures_ = 0;
     reason_ = "Grip engaged";
-    resetMotion(measured);
+    // Preserve the latched Hold/last-command reference. This makes the
+    // Hold -> Active edge bumpless; measured is intentionally not copied here.
+    previous_velocity_.setZero();
   }
 }
 
@@ -107,55 +119,31 @@ void ArmControlState::recordSolveFailure(
 }
 
 bool ArmControlState::integrateReference(
-  const ArmVector & qdot, double dt,
-  const ArmVector & q_min, const ArmVector & q_max)
+  const ArmVector & qdot, double dt, const ArmVector & measured,
+  const ArmVector & q_min, const ArmVector & q_max, double max_tracking_error)
 {
   if (!initialized_ || state_ != ArmRunState::Active ||
-    !qdot.allFinite() || !q_min.allFinite() || !q_max.allFinite() ||
-    !std::isfinite(dt) || dt <= 0.0)
+    !qdot.allFinite() || !measured.allFinite() || !q_min.allFinite() ||
+    !q_max.allFinite() || !std::isfinite(dt) || dt <= 0.0 ||
+    !std::isfinite(max_tracking_error) || max_tracking_error < 0.0)
   {
     return false;
   }
 
   for (int i = 0; i < kSingleArmDof; ++i) {
-    if (q_min[i] > q_max[i]) {
+    if (q_min[i] > q_max[i] || measured[i] < q_min[i] || measured[i] > q_max[i]) {
       return false;
     }
-    reference_[i] = std::clamp(reference_[i] + dt * qdot[i], q_min[i], q_max[i]);
+    const double integrated = reference_[i] + dt * qdot[i];
+    const double tracking_min = std::max(q_min[i], measured[i] - max_tracking_error);
+    const double tracking_max = std::min(q_max[i], measured[i] + max_tracking_error);
+    if (tracking_min > tracking_max) {
+      return false;
+    }
+    reference_[i] = std::clamp(integrated, tracking_min, tracking_max);
   }
   previous_velocity_ = qdot;
   return reference_.allFinite();
-}
-
-bool ArmControlState::updateMeasuredStepReference(
-  const ArmVector & qdot, double dt, const ArmVector & measured,
-  const ArmVector & q_min, const ArmVector & q_max)
-{
-  if (!initialized_ || state_ != ArmRunState::Active ||
-    !qdot.allFinite() || !measured.allFinite() ||
-    !q_min.allFinite() || !q_max.allFinite() ||
-    !std::isfinite(dt) || dt <= 0.0)
-  {
-    return false;
-  }
-
-  const ArmVector candidate = measured + dt * qdot;
-  if (!candidate.allFinite()) {
-    return false;
-  }
-
-  for (int i = 0; i < kSingleArmDof; ++i) {
-    if (q_min[i] > q_max[i] || candidate[i] < q_min[i] || candidate[i] > q_max[i]) {
-      return false;
-    }
-  }
-
-  // Real-robot mode deliberately does not accumulate a long-lived reference.
-  // Each command is one measured-state step, which prevents stale tracking
-  // error from integrating indefinitely when the hardware lags the target.
-  reference_ = candidate;
-  previous_velocity_ = qdot;
-  return true;
 }
 
 bool ArmControlState::initialized() const

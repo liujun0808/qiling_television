@@ -31,6 +31,8 @@ def generate_launch_description():
             executable="xrobotoolkit_pxrea_adapter_real",
             name="qiling_xrobotoolkit_pxrea_adapter_real",
             output="screen",
+            respawn=True,
+            respawn_delay=1.0,
             parameters=[str(pxrea_config)],
         ),
         Node(
