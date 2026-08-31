@@ -1,0 +1,95 @@
+# qiling_recording_real configuration.
+# This file is read by both real_recording.launch.py and episode_recorder.
+
+output_root: /home/coral/liujun/qiling_television/recordings
+
+recording:
+  storage_id: mcap
+  jpeg_quality: 90
+  # The event buttons are rising-edge triggered.
+  start_button: 2       # left Y
+  success_button: 3      # right B
+  failure_button: 1      # right A
+  joy_topic: /xr/controller_joy
+
+language:
+  # Set a non-empty default_task here, or publish a String on language_topic
+  # before pressing left Y. The task is stored in LeRobot's canonical task
+  # field during conversion.
+  default_task: ""
+  topic: /recording/language
+  require_nonempty: true
+
+cameras:
+  head:
+    serial: "135122070003"
+    camera_name: head_camera
+    camera_namespace: camera_head
+    image_topic: /camera_head/color/image_raw
+    recorded_topic: /recording/rgb/head
+  left:
+    serial: "352122273604"
+    camera_name: left_camera
+    camera_namespace: camera_left
+    image_topic: /camera_left/color/image_raw
+    recorded_topic: /recording/rgb/left
+  right:
+    serial: "409122273836"
+    camera_name: right_camera
+    camera_namespace: camera_right
+    image_topic: /camera_right/color/image_raw
+    recorded_topic: /recording/rgb/right
+
+stream:
+  width: 640
+  height: 480
+  fps: 20
+  color_format: RGB8
+
+# These messages are recorded as their original ROS types in the same MCAP
+# file as the compressed RGB messages. /human_lower_state and
+# /human_lower_command are intentionally not included: the recorder derives
+# position/velocity-only arm messages from them so torque, kp, kd and eff are
+# not stored in the observation/action recording.
+topics:
+  - name: /teleop/left_wrist_state
+    type: geometry_msgs/msg/PoseStamped
+  - name: /teleop/right_wrist_state
+    type: geometry_msgs/msg/PoseStamped
+  - name: /teleop/left_wrist_target
+    type: geometry_msgs/msg/PoseStamped
+  - name: /teleop/right_wrist_target
+    type: geometry_msgs/msg/PoseStamped
+  - name: /teleop/left_control_mode
+    type: std_msgs/msg/UInt8
+  - name: /teleop/right_control_mode
+    type: std_msgs/msg/UInt8
+  - name: /teleop/startup_home_complete
+    type: std_msgs/msg/Bool
+  - name: /teleop/o6_trigger_state
+    type: std_msgs/msg/UInt8
+  - name: /xr/left_controller_pose
+    type: geometry_msgs/msg/PoseStamped
+  - name: /xr/right_controller_pose
+    type: geometry_msgs/msg/PoseStamped
+
+derived_topics:
+  lowstate_topic: /human_lower_state
+  command_topic: /human_lower_command
+  observation_joint_state_topic: /recording/observation/joint_state
+  action_joint_position_topic: /recording/action/joint_position
+  joint_names:
+    - left_shoulder_pitch_joint
+    - left_shoulder_roll_joint
+    - left_shoulder_yaw_joint
+    - left_elbow_joint
+    - left_wrist_roll_joint
+    - left_wrist_pitch_joint
+    - left_wrist_yaw_joint
+    - right_shoulder_pitch_joint
+    - right_shoulder_roll_joint
+    - right_shoulder_yaw_joint
+    - right_elbow_joint
+    - right_wrist_roll_joint
+    - right_wrist_pitch_joint
+    - right_wrist_yaw_joint

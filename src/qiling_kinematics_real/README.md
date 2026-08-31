@@ -98,6 +98,10 @@ O6 内部状态话题暂定为：
 `/handscmd` 发送一次双手命令；Quest 输入超时期间，Trigger 状态节点保持
 最后稳定状态，适配器因此保持最后一个手部目标位置。
 
+`/xr/controller_joy` 的实体按键索引为：左 X=`buttons[0]`、右 A=`buttons[1]`、
+左 Y=`buttons[2]`、右 B=`buttons[3]`，左右 Grip 分别为 `buttons[4]` 和
+`buttons[5]`。
+
 当前 O6 姿态与速度为：
 
 ```text

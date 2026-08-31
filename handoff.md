@@ -16,7 +16,8 @@
 - 手臂控制接口最高 50 Hz；
 - 固定 base_link，腿部不参与 IK 控制；
 - 当前使用的 Pinocchio 模型是 src/qi_robot_description/urdf/s4_dual_arm.urdf；
-- 暂时不实现躯干避障和数据录制。
+- 暂时不实现躯干避障；数据录制已独立实现第一版，后续继续做真机验证和 LeRobot
+  数据质量检查。
 
 ## 2. 当前代码包
 
@@ -414,7 +415,8 @@ DDS lowstate → /human_lower_state
 - 闭合/张开目标值；
 - 是否需要位置、速度、力矩或模式字段。
 
-还需要确认 Quest 前方按钮在 `/xr/controller_joy` 中的实际索引。最终输入语义为：
+Quest 前方按钮在 `/xr/controller_joy` 中的当前索引为左 Y=`buttons[2]`、右 B=`buttons[3]`。
+O6 仍使用 Trigger，最终输入语义为：
 
 ~~~text
 左手柄前方按钮按住 → 左 O6 闭合
@@ -491,20 +493,26 @@ ros2 topic hz /human_lower_command
 
 ### 8.6 录制功能
 
-录制暂时搁置。未来计划记录：
+已新增 `qiling_recording_real` 的第一版真机 RGB episode 录制链路。录制器独立于
+遥操控制链，只订阅数据，不发布机器人控制指令。当前配置记录：
 
-- 头部 D435；
-- 左腕 D405；
-- 右腕 D405；
+- 头部 D435i、左腕 D405、右腕 D405 的 RGB 图像（640×480@20 Hz，JPEG 压缩）；
 - 双臂实际关节位置；
 - 双臂关节速度；
 - 双臂实际末端位姿；
-- O6 实际状态；
-- 期望末端位姿作为主要 action；
-- 左 X 成功标记；
-- 右 A 失败标记。
+- O6 目标状态（当前仍没有可用的真实电机反馈话题）；
+- 双臂关节位置目标和末端位姿目标，转换时可选择任一种作为 action；
+- 每个 episode 的语言任务标签；
+- 左 Y 开始录制；
+- 右 B 写入成功事件并停止录制；
+- 右 A 写入失败事件并停止录制。
 
-当前没有 recorder，也没有 LeRobot 转换脚本。
+每个 episode 的 MCAP 保存压缩 RGB、选定的遥操状态和派生的关节数据；事件写入
+`events.jsonl`，配置、相机序列号和任务标签写入 `session.yaml`。录制器只从
+`/human_lower_state`、`/human_lower_command` 提取关节位置/速度和位置目标，不保存
+原始 MIT 消息中的力矩、`kp`、`kd`、`vel` 等底层字段，派生 `JointState.effort` 为空。
+已提供 `convert_to_lerobot.py`，可离线生成 LeRobot Dataset v3；默认主 action 为
+14 维双臂关节位置目标，同时保留末端位姿 action 供后续选择。
 
 ## 9. 按键约定
 
@@ -520,8 +528,9 @@ ros2 topic hz /human_lower_command
 右手柄前方按钮按住：右 O6 闭合
 右手柄前方按钮松开：右 O6 张开
 
-左 X：后续录制中的成功标记
-右 A：后续录制中的失败标记
+左 Y：开始录制
+右 B：成功标记并停止录制
+右 A：失败标记并停止录制
 ~~~
 
 ## 10. 后续实现顺序
@@ -536,8 +545,9 @@ ros2 topic hz /human_lower_command
 8. 获取 O6 消息定义，按最终按钮语义实现 O6 实际命令适配；
 9. 验证 O6 单独闭合、张开、超时释放和 home 门控；
 10. 将 topic_convertor、XRoboToolkit、真机 IK 和 O6 统一到总启动流程；
-11. 接入三路相机和 recorder；
-12. 编写中间数据到 LeRobot 的转换脚本并做 episode 回放检查。
+11. 在真机上验证三路相机和 recorder 的 640×480@20 Hz 采集；
+12. 使用语言标签录制成功/失败 episode，转换为 LeRobot Dataset v3；
+13. 做图像、观测、action 时间对齐和数据集回放检查。
 
 ## 11. 当前新增：仿真启动 Home 流程
 
@@ -691,7 +701,7 @@ XRoboToolkit 服务
 topic_convertor
 qiling_kinematics_real
 O6 command adapter
-后续 recorder
+qiling_recording_real recorder
 ~~~
 
 统一脚本需要具备：启动顺序、PID 管理、日志目录、异常退出清理和停止时的安全输出。
@@ -704,10 +714,12 @@ O6 command adapter
 - 三路图像；
 - 双臂实际关节位置和速度；
 - 双臂实际末端位姿；
-- O6 实际状态；
-- 期望末端位姿作为 action；
+- O6 目标状态（真实反馈接入前不作为可靠观测）；
+- 双臂关节位置目标、末端位姿目标（转换时选择 action）；
+- 不记录关节力矩等 MIT 底层字段；
+- 语言任务标签；
 - 时间戳、episode 编号和任务标签；
-- 左 X 成功、右 A 失败标记。
+- 左 Y 开始；右 B 成功并停止；右 A 失败并停止。
 
-录制原始 ROS2 数据，不强行在实时控制线程内生成 LeRobot 格式。录制完成后再使用
-独立转换脚本生成 LeRobot Dataset v3，并检查图像、状态和 action 的时间对齐。
+录制原始的精选 ROS2 数据，不强行在实时控制线程内生成 LeRobot 格式。录制完成后
+使用独立转换脚本生成 LeRobot Dataset v3，并检查图像、状态和 action 的时间对齐。

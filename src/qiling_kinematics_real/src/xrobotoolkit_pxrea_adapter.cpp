@@ -30,6 +30,7 @@ struct ControllerState
   double trigger{0.0};
   double grip{0.0};
   bool primary_button{false};
+  bool secondary_button{false};
   bool pose_valid{false};
 };
 
@@ -130,6 +131,15 @@ bool parseController(const json & value, ControllerState & controller)
     }
     if (value.contains("primaryButton")) {
       parseBool(value.at("primaryButton"), controller.primary_button);
+    }
+    // Quest Y/B are represented by the controller's secondary button.  Keep
+    // a few spelling variants because PXREA JSON versions have used both
+    // camelCase and snake_case names.
+    for (const char * key : {"secondaryButton", "secondary_button", "button2"}) {
+      if (value.contains(key)) {
+        parseBool(value.at(key), controller.secondary_button);
+        break;
+      }
     }
   } catch (const std::exception &) {
     return false;
@@ -330,6 +340,8 @@ private:
 
     JoyMsg joy;
     joy.header.stamp = stamp;
+    // buttons[0]/[1] are Quest X/A, buttons[2]/[3] are Quest Y/B, and
+    // buttons[4]/[5] are digitalized left/right Grip.
     joy.buttons.assign(6, 0);
     // axes[0:2] are triggers, axes[2:4] are analog grips for the later O6 adapter.
     joy.axes = {
@@ -339,6 +351,9 @@ private:
     // Quest primary buttons: left X -> buttons[0], right A -> buttons[1].
     joy.buttons[0] = frame.left.primary_button ? 1 : 0;
     joy.buttons[1] = frame.right.primary_button ? 1 : 0;
+    // Quest secondary buttons: left Y -> buttons[2], right B -> buttons[3].
+    joy.buttons[2] = frame.left.secondary_button ? 1 : 0;
+    joy.buttons[3] = frame.right.secondary_button ? 1 : 0;
     joy.buttons[4] = frame.left.grip >= threshold ? 1 : 0;
     joy.buttons[5] = frame.right.grip >= threshold ? 1 : 0;
     joy_pub_->publish(joy);

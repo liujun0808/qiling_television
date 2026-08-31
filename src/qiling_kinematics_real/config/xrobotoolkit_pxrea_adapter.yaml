@@ -6,6 +6,7 @@ qiling_xrobotoolkit_pxrea_adapter_real:
     joy_topic: "/xr/controller_joy"
     input_frame: "xr_origin"
     grip_button_threshold: 0.50
+    # buttons[0]/[1] are left X/right A; buttons[2]/[3] are left Y/right B.
     frame_timeout_sec: 0.20
     # PXREA can report a server reconnect while its per-client state stream
     # remains stopped. Stop this client and let the ROS launch process spawn
