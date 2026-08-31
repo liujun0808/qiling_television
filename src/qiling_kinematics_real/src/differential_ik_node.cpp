@@ -138,6 +138,83 @@ bool computeHomeElbowDirection(
   return direction.allFinite();
 }
 
+bool validJointRange(const ArmVector & q_min, const ArmVector & q_max)
+{
+  return q_min.allFinite() && q_max.allFinite() &&
+         (q_min.array() < q_max.array()).all();
+}
+
+bool outsideJointRange(
+  const ArmVector & measured, const ArmVector & q_min, const ArmVector & q_max)
+{
+  if (!measured.allFinite() || !validJointRange(q_min, q_max)) {
+    return true;
+  }
+  return (measured.array() < q_min.array()).any() ||
+         (measured.array() > q_max.array()).any();
+}
+
+bool insideJointSafetyRange(
+  const ArmVector & measured, const ArmVector & q_min, const ArmVector & q_max,
+  double margin)
+{
+  if (!measured.allFinite() || !validJointRange(q_min, q_max) ||
+    !std::isfinite(margin) || margin < 0.0)
+  {
+    return false;
+  }
+  return (measured.array() >= (q_min.array() + margin)).all() &&
+         (measured.array() <= (q_max.array() - margin)).all();
+}
+
+ArmVector clampToJointRange(
+  const ArmVector & measured, const ArmVector & q_min, const ArmVector & q_max)
+{
+  ArmVector clamped = measured;
+  for (int i = 0; i < kSingleArmDof; ++i) {
+    clamped[i] = std::clamp(measured[i], q_min[i], q_max[i]);
+  }
+  return clamped;
+}
+
+ArmVector limitRecoveryTarget(
+  const ArmVector & measured, const ArmVector & q_min, const ArmVector & q_max,
+  double margin)
+{
+  ArmVector target = measured;
+  for (int i = 0; i < kSingleArmDof; ++i) {
+    const double safe_margin = std::min(
+      std::max(margin, 0.0), 0.5 * (q_max[i] - q_min[i]));
+    if (measured[i] < q_min[i] + safe_margin) {
+      target[i] = q_min[i] + safe_margin;
+    } else if (measured[i] > q_max[i] - safe_margin) {
+      target[i] = q_max[i] - safe_margin;
+    }
+  }
+  return target;
+}
+
+ArmVector moveReferenceTowards(
+  const ArmVector & current, const ArmVector & target, double max_step)
+{
+  ArmVector next = current;
+  const double step = std::max(max_step, 0.0);
+  for (int i = 0; i < kSingleArmDof; ++i) {
+    next[i] = std::clamp(target[i], current[i] - step, current[i] + step);
+  }
+  return next;
+}
+
+double minJointLimitDistance(
+  const ArmVector & measured, const ArmVector & q_min, const ArmVector & q_max)
+{
+  double minimum = std::numeric_limits<double>::infinity();
+  for (int i = 0; i < kSingleArmDof; ++i) {
+    minimum = std::min(minimum, std::min(measured[i] - q_min[i], q_max[i] - measured[i]));
+  }
+  return minimum;
+}
+
 }  // namespace
 
 class DifferentialIkNode final : public rclcpp::Node
@@ -260,6 +337,14 @@ private:
     declare_parameter("joint_limit_margin_rad", 0.08);
     declare_parameter("joint_limit_damper_gain", 1.0);
     declare_parameter("hard_limit_tolerance_rad", 0.005);
+    declare_parameter("active_entry_margin_rad", 0.05);
+    declare_parameter("limit_recovery_margin_rad", 0.08);
+    declare_parameter("limit_recovery_max_velocity_rps", 0.25);
+    declare_parameter("joint_limit_prediction_enabled", true);
+    declare_parameter("joint_limit_prediction_delay_sec", 0.04);
+    declare_parameter("joint_limit_prediction_margin_rad", 0.02);
+    declare_parameter("measured_velocity_filter_alpha", 0.25);
+    declare_parameter("measured_velocity_clamp_rps", 3.0);
     declare_parameter("left_q_rest", std::vector<double>{
       0.0, 0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0});
     declare_parameter("right_q_rest", std::vector<double>{
@@ -394,6 +479,12 @@ private:
     config.joint_limit_margin = get_parameter("joint_limit_margin_rad").as_double();
     config.joint_limit_damper_gain = get_parameter("joint_limit_damper_gain").as_double();
     config.hard_limit_tolerance = get_parameter("hard_limit_tolerance_rad").as_double();
+    config.joint_limit_prediction_enabled =
+      get_parameter("joint_limit_prediction_enabled").as_bool();
+    config.joint_limit_prediction_delay_sec =
+      get_parameter("joint_limit_prediction_delay_sec").as_double();
+    config.joint_limit_prediction_margin_rad =
+      get_parameter("joint_limit_prediction_margin_rad").as_double();
     const auto max_joint_velocity = get_parameter("max_joint_velocity_rps").as_double_array();
     if (max_joint_velocity.size() != kSingleArmDof) {
       throw std::runtime_error("max_joint_velocity_rps must contain exactly 7 values");
@@ -471,6 +562,47 @@ private:
   {
     filtered_target_valid_[side] = false;
     workspace_guard_[side].bad_duration_sec = 0.0;
+  }
+
+  void updateMeasuredVelocity(
+    int side, const ArmVector & measured, bool fresh, double dt, bool control_stalled)
+  {
+    if (!fresh || control_stalled || !measured.allFinite() ||
+      !std::isfinite(dt) || dt <= 0.0)
+    {
+      measured_velocity_initialized_[side] = false;
+      measured_velocity_[side].setZero();
+      return;
+    }
+
+    if (!measured_velocity_initialized_[side]) {
+      previous_measured_q_[side] = measured;
+      measured_velocity_[side].setZero();
+      measured_velocity_initialized_[side] = true;
+      return;
+    }
+
+    const double velocity_clamp = get_parameter("measured_velocity_clamp_rps").as_double();
+    const double alpha = std::clamp(
+      get_parameter("measured_velocity_filter_alpha").as_double(), 0.0, 1.0);
+    if (!std::isfinite(velocity_clamp) || velocity_clamp <= 0.0 ||
+      !std::isfinite(alpha))
+    {
+      measured_velocity_[side].setZero();
+      previous_measured_q_[side] = measured;
+      return;
+    }
+
+    ArmVector raw_velocity = (measured - previous_measured_q_[side]) / dt;
+    previous_measured_q_[side] = measured;
+    for (int i = 0; i < kSingleArmDof; ++i) {
+      raw_velocity[i] = std::clamp(raw_velocity[i], -velocity_clamp, velocity_clamp);
+    }
+    measured_velocity_[side] =
+      (1.0 - alpha) * measured_velocity_[side] + alpha * raw_velocity;
+    if (!measured_velocity_[side].allFinite()) {
+      measured_velocity_[side].setZero();
+    }
   }
 
   std::string formatArmVector(const ArmVector & values) const
@@ -908,6 +1040,7 @@ private:
     diagnostics = IkDiagnostics{};
     diagnostics.target_age_sec = target_age;
     diagnostics.joint_state_age_sec = state_age;
+    diagnostics.qdot_measured = measured_velocity_[side];
 
     if (!control.initialized()) {
       diagnostics.control_state = ArmRunState::Hold;
@@ -917,7 +1050,113 @@ private:
 
     const double state_timeout = get_parameter("joint_state_timeout_sec").as_double();
     if (!state_received || !std::isfinite(state_age) || state_age > state_timeout) {
-      control.enterHold(measured, requested_active, "JointState timeout");
+      // Keep a limit-recovery reference if the feedback stream temporarily
+      // becomes stale. Replacing it with the last measured value could put an
+      // already-out-of-range position straight back into the command.
+      if (!control.recovering()) {
+        control.enterHold(measured, requested_active, "JointState timeout");
+      }
+      finishArmCycle(side_name, previous_state, control, diagnostics);
+      return;
+    }
+
+    const ArmVector & q_min = q_min_[side];
+    const ArmVector & q_max = q_max_[side];
+    const bool measured_outside = outsideJointRange(measured, q_min, q_max);
+    const double active_entry_margin =
+      get_parameter("active_entry_margin_rad").as_double();
+    const double recovery_margin =
+      get_parameter("limit_recovery_margin_rad").as_double();
+    const double recovery_velocity =
+      get_parameter("limit_recovery_max_velocity_rps").as_double();
+
+    if (control.recovering()) {
+      control.updateGripRequest(requested_active, measured);
+      if (control_stalled) {
+        diagnostics.command_held = true;
+        finishArmCycle(side_name, previous_state, control, diagnostics);
+        return;
+      }
+
+      if (!measured_outside && insideJointSafetyRange(
+          measured, q_min, q_max, active_entry_margin))
+      {
+        control.finishLimitRecovery(requested_active, "joint limit recovery complete");
+        diagnostics.command_held = true;
+        finishArmCycle(side_name, previous_state, control, diagnostics);
+        return;
+      }
+
+      const ArmVector target_reference = limitRecoveryTarget(
+        measured, q_min, q_max, recovery_margin);
+      const ArmVector next_reference = moveReferenceTowards(
+        control.reference(), target_reference, recovery_velocity * dt);
+      control.updateRecoveryReference(next_reference);
+      resetTargetAndGuard(side);
+      elbow_geometry_[side].reset();
+      diagnostics.solver_status = SolverStatus::InvalidBounds;
+      diagnostics.min_hard_limit_distance_rad =
+        minJointLimitDistance(measured, q_min, q_max);
+      diagnostics.qdot.setZero();
+      diagnostics.command_held = true;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "%s LIMIT_RECOVERY: measured=%s reference=%s inward_target=%s "
+        "urdf_range=[%s, %s] grip_pressed=%s",
+        side_name, formatArmVector(measured).c_str(),
+        formatArmVector(control.reference()).c_str(),
+        formatArmVector(target_reference).c_str(), formatArmVector(q_min).c_str(),
+        formatArmVector(q_max).c_str(), requested_active ? "true" : "false");
+      finishArmCycle(side_name, previous_state, control, diagnostics);
+      return;
+    }
+
+    if (measured_outside) {
+      // Never use the out-of-range feedback value as a position command. The
+      // first recovery command is clamped to the exact URDF boundary and all
+      // subsequent references move toward the interior recovery target.
+      control.enterLimitRecovery(
+        clampToJointRange(measured, q_min, q_max), requested_active,
+        "measured position outside URDF range; limit recovery");
+      resetTargetAndGuard(side);
+      elbow_geometry_[side].reset();
+      diagnostics.solver_status = SolverStatus::InvalidBounds;
+      diagnostics.min_hard_limit_distance_rad =
+        minJointLimitDistance(measured, q_min, q_max);
+      diagnostics.qdot.setZero();
+      diagnostics.command_held = true;
+      RCLCPP_ERROR(
+        get_logger(),
+        "%s entered LIMIT_RECOVERY: measured=%s was outside URDF range; "
+        "initial_reference=%s grip_pressed=%s",
+        side_name, formatArmVector(measured).c_str(),
+        formatArmVector(control.reference()).c_str(), requested_active ? "true" : "false");
+      finishArmCycle(side_name, previous_state, control, diagnostics);
+      return;
+    }
+
+    // Check the measured state before updateGripRequest can create ACTIVE.
+    // A controller press near a hard limit is latched as a rejected Hold and
+    // requires a release/re-press after the arm has returned to the safe zone.
+    if (requested_active && control.state() == ArmRunState::Hold &&
+      !control.releaseRequired() && !insideJointSafetyRange(
+        measured, q_min, q_max, active_entry_margin))
+    {
+      control.rejectActivation(
+        true, measured, "ACTIVE rejected: measured joint is outside safety range");
+      resetTargetAndGuard(side);
+      elbow_geometry_[side].reset();
+      diagnostics.solver_status = SolverStatus::InvalidBounds;
+      diagnostics.min_hard_limit_distance_rad =
+        minJointLimitDistance(measured, q_min, q_max);
+      diagnostics.qdot.setZero();
+      diagnostics.command_held = true;
+      RCLCPP_WARN(
+        get_logger(),
+        "%s ACTIVE rejected before activation: measured=%s "
+        "safety_margin=%.4f urdf_range=[%s, %s]; release and re-press Grip",
+        side_name, formatArmVector(measured).c_str(), active_entry_margin,
+        formatArmVector(q_min).c_str(), formatArmVector(q_max).c_str());
       finishArmCycle(side_name, previous_state, control, diagnostics);
       return;
     }
@@ -983,6 +1222,7 @@ private:
     position_input.q_min = q_min_[side];
     position_input.q_max = q_max_[side];
     position_input.qdot_previous = control.previousVelocity();
+    position_input.qdot_measured = measured_velocity_[side];
     position_input.dt = dt;
 
     HierarchicalDIKSolver::Result result;
@@ -1016,6 +1256,8 @@ private:
     diagnostics.solve_time_us = result.solve_time_us;
     diagnostics.joint_limit_damper_active = result.joint_limit_damper_active;
     diagnostics.min_hard_limit_distance_rad = result.min_hard_limit_distance_rad;
+    diagnostics.joint_limit_prediction_active = result.joint_limit_prediction_active;
+    diagnostics.min_predicted_limit_distance_rad = result.min_predicted_limit_distance_rad;
     diagnostics.position_rank = result.position_rank;
     diagnostics.position_sigma_min = result.position_sigma_min;
     diagnostics.position_condition_number = result.position_condition_number;
@@ -1168,6 +1410,7 @@ private:
       get_logger(), *get_clock(),
       get_parameter("diagnostics_log_period_ms").as_int(),
       "%s state=%s held=%s solver=%s target_age=%.3f state_age=%.3f qdot_max=%.3f "
+      "qdot_measured_max=%.3f prediction=%s predicted_limit_distance=%.4f "
       "damper=%s limit_distance=%.4f sigma_position=%.5f sigma_wrist=%.5f "
       "speed=(%.2f,%.2f) "
       "elbow_valid=%s swivel=%.4f elbow_status=%s elbow_applied=%s elbow_scale=%.2f",
@@ -1178,6 +1421,9 @@ private:
       diagnostics.target_age_sec,
       diagnostics.joint_state_age_sec,
       diagnostics.qdot.cwiseAbs().maxCoeff(),
+      diagnostics.qdot_measured.cwiseAbs().maxCoeff(),
+      diagnostics.joint_limit_prediction_active ? "true" : "false",
+      diagnostics.min_predicted_limit_distance_rad,
       diagnostics.joint_limit_damper_active ? "true" : "false",
       diagnostics.min_hard_limit_distance_rad,
       diagnostics.position_sigma_min,
@@ -1256,6 +1502,10 @@ private:
       state_received[kLeftSide] && state_age[kLeftSide] <= state_timeout;
     const bool right_state_fresh =
       state_received[kRightSide] && state_age[kRightSide] <= state_timeout;
+    updateMeasuredVelocity(
+      kLeftSide, q_snapshot[kLeftSide], left_state_fresh, dt, control_stalled);
+    updateMeasuredVelocity(
+      kRightSide, q_snapshot[kRightSide], right_state_fresh, dt, control_stalled);
     publishCurrentState(arm_kinematics, left_state_fresh, right_state_fresh);
 
     // Startup home owns the arm command path until both measured arms have
@@ -1453,6 +1703,9 @@ private:
   std::array<Eigen::Vector3d, kSideCount> home_elbow_direction_{};
   std::array<TimedTarget, kSideCount> filtered_targets_{};
   std::array<bool, kSideCount> filtered_target_valid_{};
+  std::array<ArmVector, kSideCount> previous_measured_q_{};
+  std::array<ArmVector, kSideCount> measured_velocity_{};
+  std::array<bool, kSideCount> measured_velocity_initialized_{};
   std::array<WorkspaceGuardState, kSideCount> workspace_guard_{};
   std::unique_ptr<HierarchicalDIKSolver> left_solver_;
   std::unique_ptr<HierarchicalDIKSolver> right_solver_;

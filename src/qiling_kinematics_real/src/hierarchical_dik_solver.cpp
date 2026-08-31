@@ -85,6 +85,7 @@ bool finitePositionInput(const HierarchicalDIKSolver::PositionInput & input)
          input.q_min.allFinite() &&
          input.q_max.allFinite() &&
          input.qdot_previous.allFinite() &&
+         input.qdot_measured.allFinite() &&
          std::isfinite(input.dt) && input.dt > 0.0;
 }
 
@@ -323,6 +324,10 @@ HierarchicalDIKSolver::Result HierarchicalDIKSolver::solvePositionPrimary(
     !std::isfinite(config.joint_limit_damper_gain) ||
     config.joint_limit_damper_gain <= 0.0 ||
     !std::isfinite(config.hard_limit_tolerance) || config.hard_limit_tolerance < 0.0 ||
+    !std::isfinite(config.joint_limit_prediction_delay_sec) ||
+    config.joint_limit_prediction_delay_sec < 0.0 ||
+    !std::isfinite(config.joint_limit_prediction_margin_rad) ||
+    config.joint_limit_prediction_margin_rad < 0.0 ||
     !std::isfinite(config.rank_threshold) || config.rank_threshold <= 0.0 ||
     !config.max_joint_velocity_rps.allFinite() ||
     (config.max_joint_velocity_rps.array() <= 0.0).any() ||
@@ -389,6 +394,45 @@ HierarchicalDIKSolver::Result HierarchicalDIKSolver::solvePositionPrimary(
     // remain feasible for every measured state inside the hard envelope.
     double lower = std::max(-velocity_limit, (q_min - q) / input.dt);
     double upper = std::min(velocity_limit, (q_max - q) / input.dt);
+
+    // Reserve the distance needed to stop an outward-moving joint. This is a
+    // velocity constraint only: the URDF interval above remains the physical
+    // hard range, and a measured violation is still handled by the node's
+    // dedicated recovery state before the solver is called.
+    if (config.joint_limit_prediction_enabled) {
+      const double joint_range = q_max - q_min;
+      const double prediction_margin = std::min(
+        config.joint_limit_prediction_margin_rad, 0.5 * joint_range);
+      const double speed = std::abs(input.qdot_measured[i]);
+      const double braking_acceleration = config.max_joint_acceleration_rps2[i];
+      const double raw_stopping_distance =
+        speed * config.joint_limit_prediction_delay_sec +
+        0.5 * speed * speed / braking_acceleration;
+      // Keep the predictive interval feasible even if a transient feedback
+      // derivative is much larger than the configured command velocity.
+      const double max_stopping_distance = std::max(
+        0.0, joint_range - 2.0 * prediction_margin);
+      const double stopping_distance = std::min(
+        std::max(raw_stopping_distance, 0.0), max_stopping_distance);
+      const double lower_guard = q_min + prediction_margin +
+        (input.qdot_measured[i] < 0.0 ? stopping_distance : 0.0);
+      const double upper_guard = q_max - prediction_margin -
+        (input.qdot_measured[i] > 0.0 ? stopping_distance : 0.0);
+
+      result.joint_limit_prediction_active = true;
+      const double predicted_distance = std::min(q - lower_guard, upper_guard - q);
+      result.min_predicted_limit_distance_rad = i == 0 ?
+        predicted_distance : std::min(
+          result.min_predicted_limit_distance_rad, predicted_distance);
+      // If the measured state is already inside the stopping-distance guard,
+      // the exact one-cycle target can require more than the configured
+      // command speed. Saturate that inward request at the velocity limit so
+      // the QP remains feasible and commands the strongest safe recovery.
+      lower = std::max(
+        lower, std::min(velocity_limit, (lower_guard - q) / input.dt));
+      upper = std::min(
+        upper, std::max(-velocity_limit, (upper_guard - q) / input.dt));
+    }
 
     // The margin is a velocity-damper influence zone, not a second hard
     // position range. Outward velocity decreases continuously to zero at the

@@ -149,6 +149,49 @@ TEST(ArmControlState, TimeoutRequiresReleaseBeforeReactivation)
   EXPECT_TRUE(state.active());
 }
 
+TEST(ArmControlState, LimitRecoveryOwnsReferenceAcrossGripEdges)
+{
+  ArmControlState state("left");
+  const ArmVector measured = ArmVector::Constant(0.2);
+  state.initialize(measured);
+  state.updateGripRequest(true, measured);
+  ASSERT_TRUE(state.active());
+
+  const ArmVector boundary = ArmVector::Constant(0.5);
+  state.enterLimitRecovery(boundary, true, "measured position outside URDF range");
+  ASSERT_TRUE(state.recovering());
+  EXPECT_TRUE(state.reference().isApprox(boundary));
+
+  const ArmVector inward = ArmVector::Constant(0.4);
+  state.updateRecoveryReference(inward);
+  state.updateGripRequest(false, measured);
+  EXPECT_TRUE(state.recovering());
+  EXPECT_TRUE(state.reference().isApprox(inward));
+
+  state.finishLimitRecovery(false, "recovery complete");
+  EXPECT_EQ(state.state(), ArmRunState::Hold);
+  EXPECT_FALSE(state.releaseRequired());
+  EXPECT_TRUE(state.reference().isApprox(inward));
+}
+
+TEST(ArmControlState, ActivationIsRejectedUntilGripRelease)
+{
+  ArmControlState state("right");
+  const ArmVector measured = ArmVector::Constant(0.2);
+  state.initialize(measured);
+
+  state.rejectActivation(true, measured, "outside activation safety range");
+  EXPECT_EQ(state.state(), ArmRunState::Hold);
+  EXPECT_TRUE(state.releaseRequired());
+  state.updateGripRequest(true, measured);
+  EXPECT_FALSE(state.active());
+
+  state.updateGripRequest(false, measured);
+  EXPECT_FALSE(state.releaseRequired());
+  state.updateGripRequest(true, measured);
+  EXPECT_TRUE(state.active());
+}
+
 TEST(ArmControlState, ConsecutiveFailuresLatchFault)
 {
   ArmControlState state("right");

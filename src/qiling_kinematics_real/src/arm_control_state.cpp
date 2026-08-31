@@ -32,6 +32,15 @@ void ArmControlState::updateGripRequest(bool pressed, const ArmVector & measured
     return;
   }
 
+  // Limit recovery owns the command reference until the measured state has
+  // returned to the activation-safe region. Grip edges must not cancel this
+  // path by re-synchronizing the reference to a still-out-of-range position.
+  if (state_ == ArmRunState::LimitRecovery) {
+    grip_pressed_ = pressed;
+    previous_velocity_.setZero();
+    return;
+  }
+
   const bool rising_edge = pressed && !grip_pressed_;
   const bool falling_edge = !pressed && grip_pressed_;
   grip_pressed_ = pressed;
@@ -83,6 +92,62 @@ void ArmControlState::enterHold(
   if (entering_hold || newly_requiring_release) {
     resetMotion(measured);
   }
+}
+
+void ArmControlState::rejectActivation(
+  bool pressed, const ArmVector & measured, const std::string & reason)
+{
+  if (!initialized_ || !measured.allFinite()) {
+    return;
+  }
+  const bool entering_rejected_hold = state_ != ArmRunState::Hold || !release_required_;
+  state_ = ArmRunState::Hold;
+  release_required_ = true;
+  grip_pressed_ = pressed;
+  consecutive_solve_failures_ = 0;
+  reason_ = reason;
+  if (entering_rejected_hold) {
+    resetMotion(measured);
+  } else {
+    previous_velocity_.setZero();
+  }
+}
+
+void ArmControlState::enterLimitRecovery(
+  const ArmVector & initial_reference, bool pressed, const std::string & reason)
+{
+  if (!initialized_ || !initial_reference.allFinite()) {
+    return;
+  }
+  state_ = ArmRunState::LimitRecovery;
+  release_required_ = true;
+  grip_pressed_ = pressed;
+  consecutive_solve_failures_ = 0;
+  reason_ = reason;
+  reference_ = initial_reference;
+  previous_velocity_.setZero();
+}
+
+void ArmControlState::updateRecoveryReference(const ArmVector & reference)
+{
+  if (state_ != ArmRunState::LimitRecovery || !reference.allFinite()) {
+    return;
+  }
+  reference_ = reference;
+  previous_velocity_.setZero();
+}
+
+void ArmControlState::finishLimitRecovery(bool pressed, const std::string & reason)
+{
+  if (state_ != ArmRunState::LimitRecovery) {
+    return;
+  }
+  state_ = ArmRunState::Hold;
+  release_required_ = pressed;
+  grip_pressed_ = pressed;
+  consecutive_solve_failures_ = 0;
+  reason_ = reason;
+  previous_velocity_.setZero();
 }
 
 void ArmControlState::enterFault(const ArmVector & measured, const std::string & reason)
@@ -154,6 +219,11 @@ bool ArmControlState::initialized() const
 bool ArmControlState::active() const
 {
   return state_ == ArmRunState::Active;
+}
+
+bool ArmControlState::recovering() const
+{
+  return state_ == ArmRunState::LimitRecovery;
 }
 
 bool ArmControlState::releaseRequired() const

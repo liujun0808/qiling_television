@@ -147,6 +147,27 @@ TEST(PositionPrimarySolver, HardLimitStillAllowsInwardRecovery)
   EXPECT_LT(result.qdot[0], -0.1);
 }
 
+TEST(PositionPrimarySolver, PredictiveStoppingDistanceForcesInwardMotion)
+{
+  auto config = unregularizedConfig();
+  config.max_joint_acceleration_rps2.setConstant(1.0);
+  config.joint_limit_prediction_enabled = true;
+  config.joint_limit_prediction_delay_sec = 0.04;
+  config.joint_limit_prediction_margin_rad = 0.02;
+  HierarchicalDIKSolver solver(config);
+  auto input = nominalInput();
+  input.q_measured[0] = 1.90;
+  input.qdot_measured[0] = 0.50;
+  input.position_error.x() = 0.10;
+
+  const auto result = solver.solvePositionPrimary(input);
+  ASSERT_TRUE(result.success);
+  EXPECT_TRUE(result.joint_limit_prediction_active);
+  EXPECT_LT(result.qdot_upper[0], 0.0);
+  EXPECT_LT(result.qdot[0], 0.0);
+  EXPECT_LT(result.min_predicted_limit_distance_rad, 0.0);
+}
+
 TEST(PositionPrimarySolver, SmallHardLimitOvershootCommandsRecoveryWithoutInvalidBounds)
 {
   auto config = unregularizedConfig();

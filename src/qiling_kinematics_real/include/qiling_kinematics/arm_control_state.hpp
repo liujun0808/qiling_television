@@ -16,6 +16,12 @@ public:
   void updateGripRequest(bool pressed, const ArmVector & measured);
   void enterHold(
     const ArmVector & measured, bool require_release, const std::string & reason);
+  void rejectActivation(
+    bool pressed, const ArmVector & measured, const std::string & reason);
+  void enterLimitRecovery(
+    const ArmVector & initial_reference, bool pressed, const std::string & reason);
+  void updateRecoveryReference(const ArmVector & reference);
+  void finishLimitRecovery(bool pressed, const std::string & reason);
   void enterFault(const ArmVector & measured, const std::string & reason);
 
   void recordSolveSuccess();
@@ -29,6 +35,7 @@ public:
 
   bool initialized() const;
   bool active() const;
+  bool recovering() const;
   bool releaseRequired() const;
   ArmRunState state() const;
   int consecutiveSolveFailures() const;

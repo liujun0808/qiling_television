@@ -63,6 +63,19 @@ qiling_differential_ik_real:
     joint_limit_margin_rad: 0.08
     joint_limit_damper_gain: 1.0
     hard_limit_tolerance_rad: 0.005
+    # Refuse ACTIVE when feedback is already too close to a URDF hard limit.
+    active_entry_margin_rad: 0.05
+    # If feedback crosses the URDF limit, move the command reference back into
+    # this interior zone at a bounded speed before allowing teleoperation.
+    limit_recovery_margin_rad: 0.08
+    limit_recovery_max_velocity_rps: 0.25
+    # Predictive stopping-distance protection. This adds only velocity bounds;
+    # the current URDF remains the exact physical position range.
+    joint_limit_prediction_enabled: true
+    joint_limit_prediction_delay_sec: 0.04
+    joint_limit_prediction_margin_rad: 0.02
+    measured_velocity_filter_alpha: 0.25
+    measured_velocity_clamp_rps: 3.0
     # Startup home: left [0, 10, 0, -90, 0, 0, 0] deg;
     # right [0, -10, 0, -90, 0, 0, 0] deg.
     left_q_rest: [0.0, 0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0]

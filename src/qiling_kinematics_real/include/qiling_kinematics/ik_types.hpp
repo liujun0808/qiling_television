@@ -24,6 +24,7 @@ enum class ArmRunState
 {
   Hold,
   Active,
+  LimitRecovery,
   Fault,
 };
 
@@ -45,6 +46,8 @@ inline const char * toString(ArmRunState state)
       return "HOLD";
     case ArmRunState::Active:
       return "ACTIVE";
+    case ArmRunState::LimitRecovery:
+      return "LIMIT_RECOVERY";
     case ArmRunState::Fault:
       return "FAULT";
   }

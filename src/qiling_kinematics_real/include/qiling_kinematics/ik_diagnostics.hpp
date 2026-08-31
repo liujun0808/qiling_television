@@ -20,6 +20,8 @@ struct IkDiagnostics
   double solve_time_us{0.0};
   bool joint_limit_damper_active{false};
   double min_hard_limit_distance_rad{0.0};
+  bool joint_limit_prediction_active{false};
+  double min_predicted_limit_distance_rad{0.0};
   int position_rank{0};
   double position_sigma_min{0.0};
   double position_condition_number{0.0};
@@ -44,6 +46,7 @@ struct IkDiagnostics
   double elbow_orientation_degradation_rps{0.0};
 
   ArmVector qdot{ArmVector::Zero()};
+  ArmVector qdot_measured{ArmVector::Zero()};
 };
 
 }  // namespace qiling_kinematics

@@ -58,6 +58,11 @@ public:
     double characteristic_length{0.25};
     double joint_limit_damper_gain{1.0};
     double hard_limit_tolerance{0.005};
+    // Predictive joint-limit protection. The measured velocity is used only
+    // to reserve the distance required to brake before the URDF hard limit.
+    bool joint_limit_prediction_enabled{false};
+    double joint_limit_prediction_delay_sec{0.0};
+    double joint_limit_prediction_margin_rad{0.0};
     ArmVector max_joint_velocity_rps{ArmVector::Constant(1.5)};
     // Keep the library default backwards-compatible; the runtime YAML sets
     // the finite safety values used by teleoperation.
@@ -87,6 +92,7 @@ public:
     ArmVector q_min{ArmVector::Zero()};
     ArmVector q_max{ArmVector::Zero()};
     ArmVector qdot_previous{ArmVector::Zero()};
+    ArmVector qdot_measured{ArmVector::Zero()};
     double dt{0.02};
   };
 
@@ -126,6 +132,8 @@ public:
     int orientation_proxqp_status{-1};
     bool joint_limit_damper_active{false};
     double min_hard_limit_distance_rad{0.0};
+    bool joint_limit_prediction_active{false};
+    double min_predicted_limit_distance_rad{0.0};
     double position_sigma_min{0.0};
     double position_sigma_max{0.0};
     double position_condition_number{0.0};
