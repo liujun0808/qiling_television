@@ -86,6 +86,7 @@ enum class StartupHomePhase
   SettleAtTransition,
   MoveToHome,
   SettleAtHome,
+  TransitionToTeleop,
   HoldForRecording,
   MoveDirectToHome,
   Complete,
@@ -105,6 +106,8 @@ const char * toString(StartupHomePhase phase)
       return "MOVE_TO_HOME";
     case StartupHomePhase::SettleAtHome:
       return "SETTLE_AT_HOME";
+    case StartupHomePhase::TransitionToTeleop:
+      return "TRANSITION_TO_TELEOP";
     case StartupHomePhase::HoldForRecording:
       return "HOLD_FOR_RECORDING";
     case StartupHomePhase::MoveDirectToHome:
@@ -399,9 +402,11 @@ private:
     declare_parameter("home_transition_duration_sec", 2.5);
     declare_parameter("home_move_duration_sec", 3.0);
     declare_parameter("home_settle_duration_sec", 0.30);
-    declare_parameter("home_transition_tolerance_rad", 0.08);
-    declare_parameter("home_tolerance_rad", 0.05);
+    declare_parameter("home_transition_tolerance_rad", 0.15);
+    declare_parameter("home_tolerance_rad", 0.15);
     declare_parameter("home_settle_timeout_sec", 4.0);
+    declare_parameter("home_hold_transition_duration_sec", 0.50);
+    declare_parameter("home_to_teleop_transition_duration_sec", 0.50);
     declare_parameter("home_log_period_ms", 1000);
 
     declare_parameter("consecutive_primary_qp_failures_to_fault", 3);
@@ -908,10 +913,20 @@ private:
       return;
     }
 
-    // Freeze the exact measured pose at the episode boundary. The next control
-    // tick enters the non-teleop home path and keeps this fixed reference.
+    // Do not switch the command reference directly from the active reference
+    // to the measured pose at the episode boundary. X (success) and A
+    // (failure) both arrive here, so this is the common bumpless transition
+    // path for both outcomes.
+    home_hold_start_q_ = {
+      left_control_.reference(), right_control_.reference()};
+    home_hold_target_q_ = measured;
+    if (!home_hold_start_q_[kLeftSide].allFinite() ||
+      !home_hold_start_q_[kRightSide].allFinite())
+    {
+      home_hold_start_q_ = measured;
+    }
     home_start_q_ = measured;
-    home_command_q_ = measured;
+    home_command_q_ = home_hold_start_q_;
     for (auto & velocity : home_command_qdot_) {
       velocity.setZero();
     }
@@ -923,7 +938,9 @@ private:
     resetTargetAndGuard(kRightSide);
     elbow_geometry_[kLeftSide].reset();
     elbow_geometry_[kRightSide].reset();
-    setHomePhase(StartupHomePhase::HoldForRecording, "episode ended; holding measured pose");
+    setHomePhase(
+      StartupHomePhase::HoldForRecording,
+      "episode ended; smoothly transitioning to measured hold pose");
 
     response->success = true;
     response->message = "recording hold accepted; press home request after marking episode";
@@ -944,10 +961,17 @@ private:
       return;
     }
 
-    // Re-home starts at the measured pose captured at the button boundary and
-    // uses no startup transition waypoint.
-    home_start_q_ = measured;
-    home_command_q_ = measured;
+    // Start from the command currently being held. Once the short recording
+    // boundary blend has completed, this is exactly the measured hold pose.
+    // Using the current command also keeps B safe if it is pressed quickly,
+    // before the boundary blend has finished.
+    home_start_q_ = home_command_q_;
+    if (!home_start_q_[kLeftSide].allFinite() ||
+      !home_start_q_[kRightSide].allFinite())
+    {
+      home_start_q_ = measured;
+    }
+    home_command_q_ = home_start_q_;
     for (auto & velocity : home_command_qdot_) {
       velocity.setZero();
     }
@@ -955,7 +979,7 @@ private:
     setHomePhase(StartupHomePhase::MoveDirectToHome, "direct home requested");
 
     response->success = true;
-    response->message = "direct measured-pose to home interpolation started";
+    response->message = "direct held-pose to home interpolation started";
     RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
   }
 
@@ -1001,6 +1025,7 @@ private:
       case StartupHomePhase::MoveToTransition:
       case StartupHomePhase::MoveToHome:
       case StartupHomePhase::MoveDirectToHome:
+      case StartupHomePhase::TransitionToTeleop:
         state.data = 1;
         break;
       case StartupHomePhase::SettleAtTransition:
@@ -1036,6 +1061,10 @@ private:
     // continuous from that physical pose.
     home_start_q_ = measured;
     home_command_q_ = measured;
+    home_hold_start_q_ = measured;
+    home_hold_target_q_ = measured;
+    home_handoff_start_q_ = measured;
+    home_handoff_target_q_ = measured;
     for (auto & velocity : home_command_qdot_) {
       velocity.setZero();
     }
@@ -1045,6 +1074,12 @@ private:
       setHomePhase(StartupHomePhase::MoveToTransition, "complete real state received");
     } else {
       home_command_q_ = home_q_;
+      if (!left_control_.initialized()) {
+        left_control_.initialize(home_q_[kLeftSide]);
+      }
+      if (!right_control_.initialized()) {
+        right_control_.initialize(home_q_[kRightSide]);
+      }
       setHomePhase(StartupHomePhase::Complete, "startup home disabled");
       home_complete_ = true;
     }
@@ -1056,7 +1091,7 @@ private:
     if (!home_started_ || home_phase_ == StartupHomePhase::Fault) {
       for (int side = 0; side < kSideCount; ++side) {
         home_command_q_[side] =
-          home_phase_ == StartupHomePhase::Fault ||
+          home_phase_ == StartupHomePhase::Fault ? measured[side] :
           home_phase_ == StartupHomePhase::HoldForRecording ?
           home_start_q_[side] : home_q_[side];
         home_command_qdot_[side].setZero();
@@ -1070,6 +1105,10 @@ private:
       std::max(get_parameter("home_transition_duration_sec").as_double(), 0.1);
     const double home_duration =
       std::max(get_parameter("home_move_duration_sec").as_double(), 0.1);
+    const double hold_transition_duration =
+      std::max(get_parameter("home_hold_transition_duration_sec").as_double(), 0.0);
+    const double home_to_teleop_duration =
+      std::max(get_parameter("home_to_teleop_transition_duration_sec").as_double(), 0.0);
     const double settle_duration =
       std::max(get_parameter("home_settle_duration_sec").as_double(), 0.0);
     const double transition_tolerance =
@@ -1129,9 +1168,45 @@ private:
         break;
 
       case StartupHomePhase::HoldForRecording:
-        home_command_q_ = home_start_q_;
-        for (auto & velocity : home_command_qdot_) {
-          velocity.setZero();
+        for (int side = 0; side < kSideCount; ++side) {
+          quinticSegment(
+            home_hold_start_q_[side], home_hold_target_q_[side], home_phase_time_sec_,
+            hold_transition_duration, home_command_q_[side], home_command_qdot_[side]);
+        }
+        if (home_phase_time_sec_ >= hold_transition_duration) {
+          home_command_q_ = home_hold_target_q_;
+          for (auto & velocity : home_command_qdot_) {
+            velocity.setZero();
+          }
+        }
+        break;
+
+      case StartupHomePhase::TransitionToTeleop:
+        for (int side = 0; side < kSideCount; ++side) {
+          quinticSegment(
+            home_handoff_start_q_[side], home_handoff_target_q_[side],
+            home_phase_time_sec_, home_to_teleop_duration,
+            home_command_q_[side], home_command_qdot_[side]);
+        }
+        if (home_phase_time_sec_ >= home_to_teleop_duration) {
+          home_command_q_ = home_handoff_target_q_;
+          for (auto & velocity : home_command_qdot_) {
+            velocity.setZero();
+          }
+          // At initial startup the arm controls have not been initialized
+          // yet. Seed them with the handoff endpoint, not the raw measured
+          // state on the next tick, so normal Hold cannot create a step.
+          if (!left_control_.initialized()) {
+            left_control_.initialize(home_handoff_target_q_[kLeftSide]);
+          }
+          if (!right_control_.initialized()) {
+            right_control_.initialize(home_handoff_target_q_[kRightSide]);
+          }
+          home_complete_ = true;
+          setHomePhase(StartupHomePhase::Complete, "home-to-teleop handoff finished");
+          RCLCPP_INFO(
+            get_logger(),
+            "home complete; release each Grip once before teleoperation");
         }
         break;
 
@@ -1158,11 +1233,15 @@ private:
         if (maxJointError(measured, home_q_) <= home_tolerance) {
           home_settle_time_sec_ += safe_dt;
           if (home_settle_time_sec_ >= settle_duration) {
-            home_complete_ = true;
-            setHomePhase(StartupHomePhase::Complete, "home reached");
-            RCLCPP_INFO(
-              get_logger(),
-              "home complete; release each Grip once before teleoperation");
+            // home_q_ is still the command being published. Smoothly hand
+            // that command to the measured pose before opening the normal
+            // teleoperation path; otherwise the first processArm() tick can
+            // replace home_q_ with q_measured in one cycle.
+            home_handoff_start_q_ = home_q_;
+            home_handoff_target_q_ = measured;
+            setHomePhase(
+              StartupHomePhase::TransitionToTeleop,
+              "home reached; starting smooth handoff to teleoperation");
           }
         } else {
           home_settle_time_sec_ = 0.0;
@@ -1800,16 +1879,16 @@ private:
   double gravityFeedforward(int side, int joint) const
   {
     if (!get_parameter("gravity_compensation_enabled").as_bool() ||
-      !home_complete_ || side < 0 || side >= kSideCount ||
+      home_phase_ != StartupHomePhase::Complete || side < 0 || side >= kSideCount ||
       joint < 0 || joint >= kSingleArmDof)
     {
       return 0.0;
     }
 
-    // A Fault must never fall through to torque-only gravity control. In
-    // Fault, the startup path may intentionally use the measured position as
-    // its command, which leaves no Kp position error to oppose a bad or
-    // unvalidated gravity torque direction.
+    // Gravity feedforward is intentionally restricted to normal teleoperation
+    // after the complete home-to-teleop handoff. Startup home, recording hold,
+    // direct return home, settling, and the smooth handoff all use position
+    // control only. This also keeps FAULT torque-free.
     const ArmControlState & control = side == kLeftSide ? left_control_ : right_control_;
     if (control.state() == ArmRunState::Fault) {
       return 0.0;
@@ -1865,6 +1944,10 @@ private:
   std::array<ArmVector, kSideCount> home_q_{};
   std::array<ArmVector, kSideCount> home_transition_q_{};
   std::array<ArmVector, kSideCount> home_start_q_{};
+  std::array<ArmVector, kSideCount> home_hold_start_q_{};
+  std::array<ArmVector, kSideCount> home_hold_target_q_{};
+  std::array<ArmVector, kSideCount> home_handoff_start_q_{};
+  std::array<ArmVector, kSideCount> home_handoff_target_q_{};
   std::array<ArmVector, kSideCount> home_command_q_{};
   std::array<ArmVector, kSideCount> home_command_qdot_{};
   std::array<ArmVector, kSideCount> gravity_torques_{};

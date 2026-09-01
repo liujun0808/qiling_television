@@ -4,7 +4,7 @@ input_root: /home/coral/liujun/qiling_television/recordings
 output_root: /home/coral/liujun/qiling_television/lerobot_dataset
 repo_id: local/qiling_television
 
-fps: 20
+fps: 30
 action_mode: joint              # joint, eef, or both
 include_alternate_actions: true
 sync_tolerance_sec: 0.025

@@ -36,25 +36,36 @@ cameras:
     serial: "135122070003"
     camera_name: head_camera
     camera_namespace: camera_head
+    width: 1280
+    height: 720
+    fps: 30
+    color_format: RGB8
     image_topic: /camera_head/color/image_raw
     recorded_topic: /recording/rgb/head
   left:
     serial: "352122273604"
     camera_name: left_camera
     camera_namespace: camera_left
+    width: 848
+    height: 480
+    fps: 30
+    color_format: RGB8
     image_topic: /camera_left/color/image_raw
     recorded_topic: /recording/rgb/left
   right:
     serial: "409122273836"
     camera_name: right_camera
     camera_namespace: camera_right
+    width: 848
+    height: 480
+    fps: 30
+    color_format: RGB8
     image_topic: /camera_right/color/image_raw
     recorded_topic: /recording/rgb/right
 
 stream:
-  width: 640
-  height: 480
-  fps: 20
+  # Per-camera profiles above are authoritative. This keeps only the common
+  # encoding format for compatibility with older session files.
   color_format: RGB8
 
 # These messages are recorded as their original ROS types in the same MCAP

@@ -184,11 +184,16 @@ class EpisodeRecorder(Node):
             f"Language: topic={self.language_topic}, "
             f"default={'<empty>' if not self.default_task else self.default_task!r}, "
             f"required={self.require_task}; task is latched at episode start")
+        stream_config = self.config.get("stream", {})
+        camera_profiles = ", ".join(
+            f"{name}={int(camera.get('width', stream_config.get('width', 640)))}x"
+            f"{int(camera.get('height', stream_config.get('height', 480)))}@"
+            f"{int(camera.get('fps', stream_config.get('fps', 30)))}Hz"
+            for name, camera in self.cameras.items()
+        )
         self.get_logger().info(
-            f"RGB cameras={len(self.cameras)}, size="
-            f"{self.config.get('stream', {}).get('width')}x"
-            f"{self.config.get('stream', {}).get('height')}@"
-            f"{self.config.get('stream', {}).get('fps')}Hz, output={self.output_root}")
+            f"RGB cameras={len(self.cameras)}, profiles={camera_profiles}, "
+            f"resize=disabled, output={self.output_root}")
 
     @staticmethod
     def _wall_time_string():
@@ -461,8 +466,8 @@ class EpisodeRecorder(Node):
                 episode_name = f"episode_{stamp}_{suffix}"
                 episode_dir = pending_root / episode_name
                 suffix += 1
+            episode_dir.mkdir(parents=True, exist_ok=False)
             bag_dir = episode_dir / "rosbag"
-            bag_dir.mkdir(parents=True, exist_ok=False)
 
             writer = SequentialWriter()
             try:

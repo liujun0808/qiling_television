@@ -14,7 +14,7 @@ def _launch_nodes(context):
     with config_path.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
 
-    stream_config = config["stream"]
+    stream_config = config.get("stream", {})
     cameras = config["cameras"]
     nodes = []
 
@@ -23,6 +23,13 @@ def _launch_nodes(context):
         # rgb_camera.color_profile. Supplying both keeps one YAML format for
         # all three devices; unsupported inactive profiles are ignored by the
         # driver because depth is disabled.
+        width = int(camera.get("width", stream_config.get("width", 640)))
+        height = int(camera.get("height", stream_config.get("height", 480)))
+        fps = int(camera.get("fps", stream_config.get("fps", 30)))
+        color_format = camera.get(
+            "color_format", stream_config.get("color_format", "RGB8")
+        )
+        color_profile = f"{width}x{height}x{fps}"
         parameters = {
             "serial_no": camera["serial"],
             "enable_color": True,
@@ -34,14 +41,10 @@ def _launch_nodes(context):
             "enable_accel": False,
             "enable_motion": False,
             "enable_rgbd": False,
-            "rgb_camera.color_profile": (
-                f'{stream_config["width"]}x{stream_config["height"]}x{stream_config["fps"]}'
-            ),
-            "rgb_camera.color_format": stream_config["color_format"],
-            "depth_module.color_profile": (
-                f'{stream_config["width"]}x{stream_config["height"]}x{stream_config["fps"]}'
-            ),
-            "depth_module.color_format": stream_config["color_format"],
+            "rgb_camera.color_profile": color_profile,
+            "rgb_camera.color_format": color_format,
+            "depth_module.color_profile": color_profile,
+            "depth_module.color_format": color_format,
             "pointcloud.enable": False,
             "align_depth.enable": False,
             "publish_tf": False,

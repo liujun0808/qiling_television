@@ -144,15 +144,27 @@ def action_names(mode, joint_names):
     return [f"eef_{name}" for name in eef_names] + [f"joint_{name}" for name in joint_names]
 
 
-def build_features(config, joint_names, action_mode, include_alternates):
-    stream = config.get("stream", {})
-    width = int(stream.get("width", 640))
-    height = int(stream.get("height", 480))
+def build_features(config, session, joint_names, action_mode, include_alternates):
+    conversion_stream = config.get("stream", {})
+    session_stream = session.get("stream", {})
+    cameras = session.get("cameras", {})
+
+    def camera_size(name):
+        camera = cameras.get(name, {})
+        width = int(camera.get(
+            "width", session_stream.get("width", conversion_stream.get("width", 640))))
+        height = int(camera.get(
+            "height", session_stream.get("height", conversion_stream.get("height", 480))))
+        return width, height
+
+    head_width, head_height = camera_size("head")
+    left_width, left_height = camera_size("left")
+    right_width, right_height = camera_size("right")
     use_videos = bool(config.get("use_videos", True))
     features = {
-        "observation.images.head": image_feature(use_videos, height, width),
-        "observation.images.left": image_feature(use_videos, height, width),
-        "observation.images.right": image_feature(use_videos, height, width),
+        "observation.images.head": image_feature(use_videos, head_height, head_width),
+        "observation.images.left": image_feature(use_videos, left_height, left_width),
+        "observation.images.right": image_feature(use_videos, right_height, right_width),
         "observation.state": vector_feature(14, joint_names),
         "observation.velocity": vector_feature(14, [f"d_{name}" for name in joint_names]),
         "observation.eef_pose": vector_feature(
@@ -333,7 +345,8 @@ def main():
     if action_mode not in ("joint", "eef", "both"):
         raise RuntimeError("action_mode must be joint, eef or both")
     include_alternates = bool(conversion.get("include_alternate_actions", True))
-    features = build_features(conversion, joint_names, action_mode, include_alternates)
+    features = build_features(
+        conversion, first_session, joint_names, action_mode, include_alternates)
 
     dataset = LeRobotDataset.create(
         repo_id=str(conversion.get("repo_id", "local/qiling_television")),

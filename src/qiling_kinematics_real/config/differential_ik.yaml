@@ -90,7 +90,7 @@ qiling_differential_ik_real:
     right_home_transition_q: [1.0, -1.2, 0.0, -1.2, 0.0, 0.0, 0.0]
     # Phase 5.0/5.2: geometry is also used by the safe tertiary elbow task.
     elbow_geometry_diagnostic_enabled: true
-    elbow_outward_weight: 1.0
+    elbow_outward_weight: 0.5
     elbow_downward_weight: 0.30
     elbow_home_weight: 0.80
     min_shoulder_wrist_distance_m: 0.05
@@ -106,8 +106,9 @@ qiling_differential_ik_real:
     # measured joint state by more than this amount. This preserves restoring
     # position torque without allowing an untracked reference to run away.
     max_reference_tracking_error_rad: 0.35
-    # Phase 6: Pinocchio gravity feedforward only. Friction and full inverse
-    # dynamics compensation are intentionally not enabled yet.
+    # Phase 6: Pinocchio gravity feedforward during normal teleoperation only.
+    # Startup home, recording hold/return-home, and home handoff use position
+    # control only. Friction and full inverse dynamics compensation remain off.
     gravity_compensation_enabled: true
     gravity_torque_scale: 1.0
     gravity_torque_limit_scale: 1.0
@@ -115,9 +116,14 @@ qiling_differential_ik_real:
     home_transition_duration_sec: 2.5
     home_move_duration_sec: 3.0
     home_settle_duration_sec: 0.30
-    home_transition_tolerance_rad: 0.08
-    home_tolerance_rad: 0.05
+    home_transition_tolerance_rad: 0.15
+    home_tolerance_rad: 0.15
     home_settle_timeout_sec: 4.0
+    # Smooth the X-success/A-failure boundary before holding the episode end
+    # pose. This prevents a reference step when ACTIVE enters HOLD_FOR_RECORDING.
+    home_hold_transition_duration_sec: 0.50
+    # Smooth the final HOME -> normal teleoperation handoff as well.
+    home_to_teleop_transition_duration_sec: 0.50
     home_log_period_ms: 1000
     qp_max_iter: 80
     qp_eps_abs: 0.00001
