@@ -9,4 +9,6 @@ action_mode: joint              # joint, eef, or both
 include_alternate_actions: true
 sync_tolerance_sec: 0.025
 use_videos: true
-include_failed: true
+# Failed/interrupted episodes are discarded by the recorder and never appear
+# in input_root. Keep this false for compatibility with any legacy folders.
+include_failed: false

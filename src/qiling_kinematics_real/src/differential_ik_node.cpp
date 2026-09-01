@@ -25,6 +25,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/u_int8.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include "qiling_kinematics/arm_control_state.hpp"
 #include "qiling_kinematics/anthropomorphic_elbow.hpp"
@@ -49,6 +50,7 @@ constexpr int kRightArmCommandOffset = 19;
 using Clock = std::chrono::steady_clock;
 using PoseMsg = geometry_msgs::msg::PoseStamped;
 using ModeMsg = std_msgs::msg::UInt8;
+using Trigger = std_srvs::srv::Trigger;
 using qiling_kinematics::ArmControlState;
 using qiling_kinematics::ArmKinematics;
 using qiling_kinematics::ArmScalarJacobian;
@@ -84,6 +86,8 @@ enum class StartupHomePhase
   SettleAtTransition,
   MoveToHome,
   SettleAtHome,
+  HoldForRecording,
+  MoveDirectToHome,
   Complete,
   Fault,
 };
@@ -101,6 +105,10 @@ const char * toString(StartupHomePhase phase)
       return "MOVE_TO_HOME";
     case StartupHomePhase::SettleAtHome:
       return "SETTLE_AT_HOME";
+    case StartupHomePhase::HoldForRecording:
+      return "HOLD_FOR_RECORDING";
+    case StartupHomePhase::MoveDirectToHome:
+      return "MOVE_DIRECT_TO_HOME";
     case StartupHomePhase::Complete:
       return "COMPLETE";
     case StartupHomePhase::Fault:
@@ -254,6 +262,19 @@ public:
     home_complete_pub_ = create_publisher<std_msgs::msg::Bool>(
       get_parameter("startup_home_complete_topic").as_string(),
       rclcpp::QoS(1).transient_local());
+    home_state_pub_ = create_publisher<std_msgs::msg::UInt8>(
+      get_parameter("home_state_topic").as_string(),
+      rclcpp::QoS(1).transient_local());
+    recording_hold_service_ = create_service<Trigger>(
+      get_parameter("recording_hold_service").as_string(),
+      std::bind(
+        &DifferentialIkNode::recordingHoldService, this,
+        std::placeholders::_1, std::placeholders::_2));
+    home_request_service_ = create_service<Trigger>(
+      get_parameter("home_request_service").as_string(),
+      std::bind(
+        &DifferentialIkNode::homeRequestService, this,
+        std::placeholders::_1, std::placeholders::_2));
 
     const double rate = get_parameter("control_rate_hz").as_double();
     const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -289,6 +310,10 @@ private:
     declare_parameter("right_state_topic", std::string("/teleop/right_wrist_state"));
     declare_parameter(
       "startup_home_complete_topic", std::string("/teleop/startup_home_complete"));
+    declare_parameter("home_state_topic", std::string("/teleop/home_state"));
+    declare_parameter(
+      "recording_hold_service", std::string("/teleop/request_recording_hold"));
+    declare_parameter("home_request_service", std::string("/teleop/request_home"));
 
     declare_parameter("target_timeout_sec", 0.25);
     declare_parameter("joint_state_timeout_sec", 0.20);
@@ -346,9 +371,11 @@ private:
     declare_parameter("measured_velocity_filter_alpha", 0.25);
     declare_parameter("measured_velocity_clamp_rps", 3.0);
     declare_parameter("left_q_rest", std::vector<double>{
-      0.0, 0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0});
+      0.0104905777, 0.6509880424, -0.1741435826, -1.7084382772,
+      0.0738155171, -0.0963225737, -0.0936522484});
     declare_parameter("right_q_rest", std::vector<double>{
-      0.0, -0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0});
+      -0.0749599487, -0.6475547552, 0.1073853672, -1.2964446545,
+      -0.0009536889, -0.4251545072, 0.4945830405});
     declare_parameter("left_home_transition_q", std::vector<double>{
       1.00, 1.20, 0.0, -1.20, 0.0, 0.0, 0.0});
     declare_parameter("right_home_transition_q", std::vector<double>{
@@ -840,6 +867,98 @@ private:
     requested_modes_[side] = message.data;
   }
 
+  bool getFreshMeasuredArms(std::array<ArmVector, kSideCount> & measured)
+  {
+    const auto now_steady = Clock::now();
+    std::array<Clock::time_point, kSideCount> state_times;
+    std::array<bool, kSideCount> state_received;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      measured = q_state_;
+      state_times = last_arm_state_time_;
+      state_received = arm_state_received_;
+    }
+
+    const double timeout = get_parameter("joint_state_timeout_sec").as_double();
+    if (!std::isfinite(timeout) || timeout <= 0.0) {
+      return false;
+    }
+    for (int side = 0; side < kSideCount; ++side) {
+      const double age = ageSeconds(now_steady, state_times[side], state_received[side]);
+      if (!state_received[side] || !measured[side].allFinite() ||
+        !std::isfinite(age) || age > timeout)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void recordingHoldService(
+    const Trigger::Request::SharedPtr /*request*/, Trigger::Response::SharedPtr response)
+  {
+    std::array<ArmVector, kSideCount> measured;
+    if (!home_complete_ || home_phase_ != StartupHomePhase::Complete ||
+      !getFreshMeasuredArms(measured))
+    {
+      response->success = false;
+      response->message =
+        "recording hold rejected: robot is not in READY home state or feedback is stale";
+      RCLCPP_WARN(get_logger(), "%s", response->message.c_str());
+      return;
+    }
+
+    // Freeze the exact measured pose at the episode boundary. The next control
+    // tick enters the non-teleop home path and keeps this fixed reference.
+    home_start_q_ = measured;
+    home_command_q_ = measured;
+    for (auto & velocity : home_command_qdot_) {
+      velocity.setZero();
+    }
+    home_complete_ = false;
+    teleop_side_ready_.fill(false);
+    left_control_.enterHold(measured[kLeftSide], true, "recording episode boundary");
+    right_control_.enterHold(measured[kRightSide], true, "recording episode boundary");
+    resetTargetAndGuard(kLeftSide);
+    resetTargetAndGuard(kRightSide);
+    elbow_geometry_[kLeftSide].reset();
+    elbow_geometry_[kRightSide].reset();
+    setHomePhase(StartupHomePhase::HoldForRecording, "episode ended; holding measured pose");
+
+    response->success = true;
+    response->message = "recording hold accepted; press home request after marking episode";
+    RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+  }
+
+  void homeRequestService(
+    const Trigger::Request::SharedPtr /*request*/, Trigger::Response::SharedPtr response)
+  {
+    std::array<ArmVector, kSideCount> measured;
+    if (home_complete_ || home_phase_ != StartupHomePhase::HoldForRecording ||
+      !getFreshMeasuredArms(measured))
+    {
+      response->success = false;
+      response->message =
+        "home request rejected: robot is not holding a completed episode or feedback is stale";
+      RCLCPP_WARN(get_logger(), "%s", response->message.c_str());
+      return;
+    }
+
+    // Re-home starts at the measured pose captured at the button boundary and
+    // uses no startup transition waypoint.
+    home_start_q_ = measured;
+    home_command_q_ = measured;
+    for (auto & velocity : home_command_qdot_) {
+      velocity.setZero();
+    }
+    teleop_side_ready_.fill(false);
+    setHomePhase(StartupHomePhase::MoveDirectToHome, "direct home requested");
+
+    response->success = true;
+    response->message = "direct measured-pose to home interpolation started";
+    RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+  }
+
   static double maxJointError(
     const std::array<ArmVector, kSideCount> & measured,
     const std::array<ArmVector, kSideCount> & target)
@@ -873,6 +992,32 @@ private:
     std_msgs::msg::Bool message;
     message.data = home_complete_;
     home_complete_pub_->publish(message);
+
+    std_msgs::msg::UInt8 state;
+    switch (home_phase_) {
+      case StartupHomePhase::WaitingForState:
+        state.data = 0;
+        break;
+      case StartupHomePhase::MoveToTransition:
+      case StartupHomePhase::MoveToHome:
+      case StartupHomePhase::MoveDirectToHome:
+        state.data = 1;
+        break;
+      case StartupHomePhase::SettleAtTransition:
+      case StartupHomePhase::SettleAtHome:
+        state.data = 2;
+        break;
+      case StartupHomePhase::Complete:
+        state.data = 3;
+        break;
+      case StartupHomePhase::Fault:
+        state.data = 4;
+        break;
+      case StartupHomePhase::HoldForRecording:
+        state.data = 5;
+        break;
+    }
+    home_state_pub_->publish(state);
   }
 
   void setHomePhase(StartupHomePhase phase, const char * reason)
@@ -881,7 +1026,7 @@ private:
     home_phase_time_sec_ = 0.0;
     home_settle_time_sec_ = 0.0;
     RCLCPP_INFO(
-      get_logger(), "startup home phase -> %s (%s)", toString(home_phase_), reason);
+      get_logger(), "home phase -> %s (%s)", toString(home_phase_), reason);
   }
 
   void beginStartupHome(const std::array<ArmVector, kSideCount> & measured)
@@ -908,10 +1053,12 @@ private:
   void updateStartupHome(
     const std::array<ArmVector, kSideCount> & measured, double dt)
   {
-    if (!home_started_ || home_complete_ || home_phase_ == StartupHomePhase::Fault) {
+    if (!home_started_ || home_phase_ == StartupHomePhase::Fault) {
       for (int side = 0; side < kSideCount; ++side) {
         home_command_q_[side] =
-          home_phase_ == StartupHomePhase::Fault ? measured[side] : home_q_[side];
+          home_phase_ == StartupHomePhase::Fault ||
+          home_phase_ == StartupHomePhase::HoldForRecording ?
+          home_start_q_[side] : home_q_[side];
         home_command_qdot_[side].setZero();
       }
       return;
@@ -981,6 +1128,28 @@ private:
         }
         break;
 
+      case StartupHomePhase::HoldForRecording:
+        home_command_q_ = home_start_q_;
+        for (auto & velocity : home_command_qdot_) {
+          velocity.setZero();
+        }
+        break;
+
+      case StartupHomePhase::MoveDirectToHome:
+        for (int side = 0; side < kSideCount; ++side) {
+          quinticSegment(
+            home_start_q_[side], home_q_[side], home_phase_time_sec_, home_duration,
+            home_command_q_[side], home_command_qdot_[side]);
+        }
+        if (home_phase_time_sec_ >= home_duration) {
+          home_command_q_ = home_q_;
+          for (auto & velocity : home_command_qdot_) {
+            velocity.setZero();
+          }
+          setHomePhase(StartupHomePhase::SettleAtHome, "direct home trajectory finished");
+        }
+        break;
+
       case StartupHomePhase::SettleAtHome:
         home_command_q_ = home_q_;
         for (auto & velocity : home_command_qdot_) {
@@ -993,7 +1162,7 @@ private:
             setHomePhase(StartupHomePhase::Complete, "home reached");
             RCLCPP_INFO(
               get_logger(),
-              "startup home complete; release each Grip once before teleoperation");
+              "home complete; release each Grip once before teleoperation");
           }
         } else {
           home_settle_time_sec_ = 0.0;
@@ -1508,7 +1677,7 @@ private:
       kRightSide, q_snapshot[kRightSide], right_state_fresh, dt, control_stalled);
     publishCurrentState(arm_kinematics, left_state_fresh, right_state_fresh);
 
-    // Startup home owns the arm command path until both measured arms have
+    // Home/re-home owns the arm command path until both measured arms have
     // reached the configured home pose. XR targets and Grip modes are ignored
     // during this phase so a held controller cannot create a pose jump.
     if (!home_complete_) {
@@ -1517,7 +1686,7 @@ private:
         if (home_started_) {
           if (home_phase_ != StartupHomePhase::Fault) {
             setHomePhase(
-              StartupHomePhase::Fault, "joint state became stale during startup home");
+              StartupHomePhase::Fault, "joint state became stale during home motion");
           }
           home_command_q_ = q_snapshot;
           for (auto & velocity : home_command_qdot_) {
@@ -1534,7 +1703,7 @@ private:
       publishCommand(leg_q_snapshot, home_command_q_, home_command_qdot_);
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), get_parameter("home_log_period_ms").as_int(),
-        "startup home phase=%s error=%.4f rad", toString(home_phase_),
+        "home phase=%s error=%.4f rad", toString(home_phase_),
         maxJointError(q_snapshot, home_phase_ == StartupHomePhase::MoveToTransition ||
           home_phase_ == StartupHomePhase::SettleAtTransition ?
           home_transition_q_ : home_q_));
@@ -1740,6 +1909,9 @@ private:
   rclcpp::Publisher<PoseMsg>::SharedPtr left_state_pub_;
   rclcpp::Publisher<PoseMsg>::SharedPtr right_state_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr home_complete_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr home_state_pub_;
+  rclcpp::Service<Trigger>::SharedPtr recording_hold_service_;
+  rclcpp::Service<Trigger>::SharedPtr home_request_service_;
   rclcpp::TimerBase::SharedPtr control_timer_;
   Clock::time_point last_control_tick_{};
 };

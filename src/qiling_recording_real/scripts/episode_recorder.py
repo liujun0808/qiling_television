@@ -2,17 +2,19 @@
 
 """Button-controlled RGB episode recorder for the real robot.
 
-The node is intentionally read-only with respect to the robot.  It subscribes
-to the XR and robot topics, compresses the three RGB streams to JPEG, and
-writes all selected messages into one MCAP file per episode.  The original
-camera header timestamp is kept in each CompressedImage; the MCAP timestamp
-is the local receive timestamp.
+The recorder is intentionally read-only with respect to the robot.  It
+subscribes to the XR, home-state, camera and selected robot topics, and calls
+the IK node's Trigger services only to request a safe hold/home state change.
+It never publishes a robot command.  A new episode is first written below
+``output_root/.pending``.  Only a successful episode is moved into the public
+episode directory; failed and interrupted episodes are discarded.
 """
 
 import copy
 import datetime as dt
 import json
 from pathlib import Path
+import shutil
 import threading
 import time
 
@@ -20,12 +22,18 @@ import cv2
 from cv_bridge import CvBridge, CvBridgeError
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from rclpy.serialization import serialize_message
 from rosbag2_py import ConverterOptions, SequentialWriter, StorageOptions, TopicMetadata
 from rosidl_runtime_py.utilities import get_message
 from sensor_msgs.msg import CompressedImage, Image, JointState, Joy
-from std_msgs.msg import String
+from std_msgs.msg import String, UInt8
+from std_srvs.srv import Trigger
 from mit_msgs.msg import MITJointCommands, MITLowState
 import yaml
 
@@ -48,8 +56,21 @@ class EpisodeRecorder(Node):
         self.jpeg_quality = max(1, min(int(recording.get("jpeg_quality", 90)), 100))
         self.joy_topic = str(recording.get("joy_topic", "/xr/controller_joy"))
         self.start_button = int(recording.get("start_button", 2))
-        self.success_button = int(recording.get("success_button", 3))
+        self.success_button = int(recording.get("success_button", 0))
         self.failure_button = int(recording.get("failure_button", 1))
+        self.home_button = int(recording.get("home_button", 3))
+
+        home = self.config.get("home", {})
+        self.home_state_topic = str(home.get("state_topic", "/teleop/home_state"))
+        self.recording_hold_service = str(
+            home.get("hold_service", "/teleop/request_recording_hold")
+        )
+        self.home_request_service = str(
+            home.get("request_service", "/teleop/request_home")
+        )
+        self.home_ready_code = int(home.get("ready_value", 3))
+        self.home_holding_code = int(home.get("holding_value", 5))
+        self.home_fault_code = int(home.get("fault_value", 4))
 
         language = self.config.get("language", {})
         self.language_topic = str(language.get("topic", "/recording/language"))
@@ -81,8 +102,14 @@ class EpisodeRecorder(Node):
         self._writer = None
         self._event_file = None
         self._episode_dir = None
+        self._episode_name = ""
         self._episode_task = ""
         self._active = False
+        self._waiting_for_home = False
+        self._hold_request_pending = False
+        self._hold_confirmed = False
+        self._home_request_pending = False
+        self._home_state_code = 0
         self._last_buttons = []
         self._bridge = CvBridge()
         self._image_subscriptions = []
@@ -92,6 +119,19 @@ class EpisodeRecorder(Node):
             Joy, self.joy_topic, self._joy_callback, qos_profile_sensor_data)
         self._language_subscription = self.create_subscription(
             String, self.language_topic, self._language_callback, qos_profile_sensor_data)
+        self._home_state_subscription = self.create_subscription(
+            UInt8,
+            self.home_state_topic,
+            self._home_state_callback,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self._hold_client = self.create_client(Trigger, self.recording_hold_service)
+        self._home_client = self.create_client(Trigger, self.home_request_service)
+
         self._lowstate_subscription = self.create_subscription(
             MITLowState, self.lowstate_topic, self._lowstate_callback, qos_profile_sensor_data)
         self._command_subscription = self.create_subscription(
@@ -134,12 +174,16 @@ class EpisodeRecorder(Node):
             )
 
         self.get_logger().info(
-            "Episode recorder ready: left Y starts, right B marks success, "
-            "right A marks failure; success/failure stop the episode")
+            "Episode recorder ready: left Y starts one episode; left X saves success; "
+            "right A discards failure; right B requests direct return to home")
+        self.get_logger().info(
+            f"Home state={self.home_state_topic} (READY={self.home_ready_code}, "
+            f"HOLDING={self.home_holding_code}, FAULT={self.home_fault_code}); "
+            f"hold service={self.recording_hold_service}, home service={self.home_request_service}")
         self.get_logger().info(
             f"Language: topic={self.language_topic}, "
             f"default={'<empty>' if not self.default_task else self.default_task!r}, "
-            f"required={self.require_task}")
+            f"required={self.require_task}; task is latched at episode start")
         self.get_logger().info(
             f"RGB cameras={len(self.cameras)}, size="
             f"{self.config.get('stream', {}).get('width')}x"
@@ -204,13 +248,22 @@ class EpisodeRecorder(Node):
     def _write_session_file(self, episode_dir, episode_name, started_ns):
         session = {
             "episode": episode_name,
+            "status": "pending",
+            "saved": False,
             "started_wall_time": self._wall_time_string(),
             "started_unix_time_ns": started_ns,
             "config_file": str(self.config_path),
             "button_mapping": {
                 "left_y_start": self.start_button,
-                "right_b_success": self.success_button,
+                "left_x_success": self.success_button,
                 "right_a_failure": self.failure_button,
+                "right_b_request_home": self.home_button,
+            },
+            "home_control": {
+                "state_topic": self.home_state_topic,
+                "hold_service": self.recording_hold_service,
+                "request_service": self.home_request_service,
+                "return_path": "measured_pose_to_home_quintic_without_transition",
             },
             "task": self._episode_task,
             "language_topic": self.language_topic,
@@ -240,10 +293,151 @@ class EpisodeRecorder(Node):
         with (episode_dir / "session.yaml").open("w", encoding="utf-8") as stream:
             yaml.safe_dump(session, stream, allow_unicode=True, sort_keys=False)
 
-    def _start_episode(self):
+    @staticmethod
+    def _update_session_result(episode_dir, status, saved):
+        session_path = episode_dir / "session.yaml"
+        with session_path.open("r", encoding="utf-8") as stream:
+            session = yaml.safe_load(stream) or {}
+        session["status"] = status
+        session["saved"] = bool(saved)
+        with session_path.open("w", encoding="utf-8") as stream:
+            yaml.safe_dump(session, stream, allow_unicode=True, sort_keys=False)
+
+    def _home_state_callback(self, message):
+        code = int(message.data)
+        became_ready = False
+        entered_fault = False
+        with self._lock:
+            previous = self._home_state_code
+            self._home_state_code = code
+            entered_fault = code == self.home_fault_code and previous != code
+            became_ready = (
+                code == self.home_ready_code
+                and previous != self.home_ready_code
+                and self._waiting_for_home
+                and not self._active
+            )
+            if became_ready:
+                self._waiting_for_home = False
+                self._hold_confirmed = False
+                self._home_request_pending = False
+
+        if entered_fault:
+            self.get_logger().error(
+                "IK home state is FAULT; no new episode can be started")
+        elif became_ready:
+            self.get_logger().info(
+                "Robot reached home; release right B and press left Y to start the next episode")
+
+    def _request_recording_hold(self):
+        with self._lock:
+            if self._hold_request_pending or self._hold_confirmed:
+                return True
+            self._hold_request_pending = True
+
+        if not self._hold_client.service_is_ready():
+            with self._lock:
+                self._hold_request_pending = False
+            self.get_logger().error(
+                f"Recording hold service is unavailable: {self.recording_hold_service}")
+            return False
+
+        try:
+            future = self._hold_client.call_async(Trigger.Request())
+            future.add_done_callback(self._recording_hold_response)
+        except Exception as error:
+            with self._lock:
+                self._hold_request_pending = False
+            self.get_logger().error(f"Failed to call recording hold service: {error}")
+            return False
+        return True
+
+    def _recording_hold_response(self, future):
+        try:
+            response = future.result()
+        except Exception as error:
+            with self._lock:
+                self._hold_request_pending = False
+            self.get_logger().error(f"Recording hold service failed: {error}")
+            return
+
+        with self._lock:
+            self._hold_request_pending = False
+            if response.success:
+                self._hold_confirmed = True
+        if response.success:
+            self.get_logger().info(
+                "Episode boundary is held at the measured pose; press right B to return home")
+        else:
+            self.get_logger().error(f"Recording hold rejected by IK node: {response.message}")
+
+    def _request_home(self):
+        with self._lock:
+            if self._home_request_pending:
+                return True
+            if not self._waiting_for_home:
+                return False
+            need_hold = not self._hold_confirmed
+            if not need_hold:
+                if self._home_state_code != self.home_holding_code:
+                    self.get_logger().warning(
+                        "Home request ignored until IK reports HOLDING_FOR_RECORDING")
+                    return False
+                self._home_request_pending = True
+
+        if need_hold:
+            self.get_logger().warning(
+                "Measured-pose hold is not confirmed; retrying hold before right B home request")
+            self._request_recording_hold()
+            return False
+
+        if not self._home_client.service_is_ready():
+            with self._lock:
+                self._home_request_pending = False
+            self.get_logger().error(
+                f"Home request service is unavailable: {self.home_request_service}")
+            return False
+
+        try:
+            future = self._home_client.call_async(Trigger.Request())
+            future.add_done_callback(self._home_response)
+        except Exception as error:
+            with self._lock:
+                self._home_request_pending = False
+            self.get_logger().error(f"Failed to call home request service: {error}")
+            return False
+        self.get_logger().info("Direct measured-pose to home interpolation requested")
+        return True
+
+    def _home_response(self, future):
+        try:
+            response = future.result()
+        except Exception as error:
+            with self._lock:
+                self._home_request_pending = False
+            self.get_logger().error(f"Home request service failed: {error}")
+            return
+
+        with self._lock:
+            self._home_request_pending = False
+        if response.success:
+            self.get_logger().info(
+                "IK accepted direct return home; recorder will wait for READY state")
+        else:
+            self.get_logger().error(f"Home request rejected by IK node: {response.message}")
+
+    def _start_episode(self, trigger="left_y"):
         with self._lock:
             if self._active:
                 self.get_logger().warning("Start requested while an episode is already active")
+                return False
+            if self._waiting_for_home:
+                self.get_logger().warning("Start requested before the robot returned to home")
+                return False
+            if self._home_state_code != self.home_ready_code:
+                self.get_logger().warning(
+                    f"Start rejected: IK home state is {self._home_state_code}, "
+                    f"expected READY={self.home_ready_code}")
                 return False
 
             task = self.current_task.strip()
@@ -259,10 +453,13 @@ class EpisodeRecorder(Node):
             stamp = dt.datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             episode_name = f"episode_{stamp}"
             self.output_root.mkdir(parents=True, exist_ok=True)
-            episode_dir = self.output_root / episode_name
+            pending_root = self.output_root / ".pending"
+            pending_root.mkdir(parents=True, exist_ok=True)
+            episode_dir = pending_root / episode_name
             suffix = 1
-            while episode_dir.exists():
-                episode_dir = self.output_root / f"{episode_name}_{suffix}"
+            while episode_dir.exists() or (self.output_root / episode_name).exists():
+                episode_name = f"episode_{stamp}_{suffix}"
+                episode_dir = pending_root / episode_name
                 suffix += 1
             bag_dir = episode_dir / "rosbag"
             bag_dir.mkdir(parents=True, exist_ok=False)
@@ -287,23 +484,26 @@ class EpisodeRecorder(Node):
                     )
             except Exception as error:
                 del writer
+                shutil.rmtree(episode_dir, ignore_errors=True)
                 self.get_logger().error(f"Cannot open episode MCAP writer: {error}")
                 return False
 
             self._writer = writer
             self._episode_dir = episode_dir
+            self._episode_name = episode_name
             self._event_file = (episode_dir / "events.jsonl").open("w", encoding="utf-8")
             self._episode_task = task
             self._active = True
             self._write_session_file(episode_dir, episode_name, started_ns)
-            self._write_event_locked("recording_started", "left_y")
+            self._write_event_locked("recording_started", trigger)
             language_message = String()
             language_message.data = task
             self._write_bag_message_locked(self.language_topic, language_message, started_ns)
-            self.get_logger().info(f"Recording started: {episode_dir}")
+            self.get_logger().info(
+                f"Episode started (pending until success): {episode_dir}; task={task!r}")
             return True
 
-    def _stop_episode(self, reason, event=None, button=None):
+    def _finish_episode(self, reason, save, event=None, button=None):
         with self._lock:
             if not self._active:
                 return False
@@ -314,17 +514,50 @@ class EpisodeRecorder(Node):
             event_file = self._event_file
             writer = self._writer
             episode_dir = self._episode_dir
+            episode_name = self._episode_name
             self._event_file = None
             self._writer = None
             self._episode_dir = None
+            self._episode_name = ""
+            self._episode_task = ""
             if event_file is not None:
                 event_file.flush()
                 event_file.close()
 
-        # Let rosbag2 finalize metadata after leaving the critical section.
+        # Let rosbag2 finalize metadata before changing/removing the directory.
         del writer
-        self.get_logger().info(f"Recording stopped ({reason}): {episode_dir}")
+        if episode_dir is None:
+            return False
+
+        if save:
+            try:
+                self._update_session_result(episode_dir, "success", True)
+                final_dir = self.output_root / episode_name
+                if final_dir.exists():
+                    raise RuntimeError(f"episode destination already exists: {final_dir}")
+                episode_dir.rename(final_dir)
+                self.get_logger().info(
+                    f"Episode saved successfully: {final_dir}")
+            except Exception as error:
+                self.get_logger().error(
+                    f"Episode was successful but could not be finalized: {error}; "
+                    "pending data has been discarded")
+                shutil.rmtree(episode_dir, ignore_errors=True)
+                # The episode is closed even when storage finalization fails;
+                # the robot must still enter the measured-pose hold path.
+                return True
+        else:
+            shutil.rmtree(episode_dir, ignore_errors=True)
+            self.get_logger().info(
+                f"Episode discarded ({reason}); no public episode directory was created")
         return True
+
+    def _enter_home_wait(self):
+        with self._lock:
+            self._waiting_for_home = True
+            self._hold_confirmed = False
+            self._home_request_pending = False
+        self._request_recording_hold()
 
     @staticmethod
     def _arm_joint_state(stamp, names, positions, velocities=None):
@@ -343,10 +576,12 @@ class EpisodeRecorder(Node):
         if not task:
             return
         with self._lock:
-            self.current_task = task
             if self._active:
-                self._write_bag_message_locked(
-                    self.language_topic, message, self.get_clock().now().nanoseconds)
+                self.get_logger().warning(
+                    "Ignoring language update during an active episode; task is latched")
+                return
+            self.current_task = task
+        self.get_logger().info(f"Next episode language task updated: {task!r}")
 
     def _lowstate_callback(self, message):
         positions = list(message.joint_states.position)
@@ -391,28 +626,43 @@ class EpisodeRecorder(Node):
                 return self._button_pressed(message, index) and not was_pressed
 
             start_edge = rising(self.start_button)
+            home_edge = rising(self.home_button)
             success_edge = rising(self.success_button)
             failure_edge = rising(self.failure_button)
             active_before = self._active
+            waiting_before = self._waiting_for_home
 
-        if not active_before and start_edge:
-            if self._start_episode():
+        if active_before:
+            receive_time_ns = self.get_clock().now().nanoseconds
+            with self._lock:
+                self._write_bag_message_locked(self.joy_topic, message, receive_time_ns)
+
+            if success_edge:
+                if self._finish_episode(
+                    "success", save=True, event="episode_success", button="left_x"):
+                    self._enter_home_wait()
+            elif failure_edge:
+                if self._finish_episode(
+                    "failure", save=False, event="episode_failure", button="right_a"):
+                    self._enter_home_wait()
+            elif home_edge:
+                self.get_logger().warning(
+                    "Right B is ignored during an active episode; mark success/failure first")
+            return
+
+        if waiting_before:
+            if home_edge:
+                self._request_home()
+            elif start_edge:
+                self.get_logger().warning(
+                    "Start ignored: press right B to request home, then wait for READY")
+            return
+
+        if start_edge:
+            if self._start_episode("left_y"):
                 with self._lock:
                     self._write_bag_message_locked(
                         self.joy_topic, message, self.get_clock().now().nanoseconds)
-            return
-
-        if not active_before:
-            return
-
-        receive_time_ns = self.get_clock().now().nanoseconds
-        with self._lock:
-            self._write_bag_message_locked(self.joy_topic, message, receive_time_ns)
-
-        if success_edge:
-            self._stop_episode("success", "episode_success", "right_b")
-        elif failure_edge:
-            self._stop_episode("failure", "episode_failure", "right_a")
 
     def _image_callback(self, camera_name, message):
         with self._lock:
@@ -444,7 +694,15 @@ class EpisodeRecorder(Node):
                 self._write_bag_message_locked(topic, message, self.get_clock().now().nanoseconds)
 
     def stop_for_shutdown(self):
-        self._stop_episode("node_shutdown", "recording_interrupted", "shutdown")
+        with self._lock:
+            active = self._active
+        if active:
+            self._finish_episode(
+                "node_shutdown", save=False,
+                event="recording_interrupted", button="shutdown")
+        with self._lock:
+            self._waiting_for_home = False
+            self._hold_confirmed = False
 
 
 def main(args=None):

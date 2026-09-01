@@ -10,6 +10,9 @@ qiling_differential_ik_real:
     left_state_topic: "/teleop/left_wrist_state"
     right_state_topic: "/teleop/right_wrist_state"
     startup_home_complete_topic: "/teleop/startup_home_complete"
+    home_state_topic: "/teleop/home_state"
+    recording_hold_service: "/teleop/request_recording_hold"
+    home_request_service: "/teleop/request_home"
     target_frame: "base_link"
     target_timeout_sec: 0.25
     joint_state_timeout_sec: 0.20
@@ -76,10 +79,11 @@ qiling_differential_ik_real:
     joint_limit_prediction_margin_rad: 0.02
     measured_velocity_filter_alpha: 0.25
     measured_velocity_clamp_rps: 3.0
-    # Startup home: left [0, 10, 0, -90, 0, 0, 0] deg;
-    # right [0, -10, 0, -90, 0, 0, 0] deg.
-    left_q_rest: [0.0, 0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0]
-    right_q_rest: [0.0, -0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0]
+    # Startup/repeated-return home from real-machine teaching, in radians.
+    # The supplied lowstate was 26 motors: 0..11 legs were excluded;
+    # 12..18 are left arm and 19..25 are right arm.
+    left_q_rest: [0.0104905777, 0.6509880424, -0.1741435826, -1.7084382772, 0.0738155171, -0.0963225737, -0.0936522484]
+    right_q_rest: [-0.0749599487, -0.6475547552, 0.1073853672, -1.2964446545, -0.0009536889, -0.4251545072, 0.4945830405]
     # Collision-checked MuJoCo transition: arms first move outward/upward,
     # then descend into the final home pose.
     left_home_transition_q: [1.0, 1.2, 0.0, -1.2, 0.0, 0.0, 0.0]

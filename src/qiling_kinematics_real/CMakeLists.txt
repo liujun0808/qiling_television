@@ -18,6 +18,7 @@ find_package(qi REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 
 add_library(qiling_dik_real_core
   src/arm_control_state.cpp
@@ -58,7 +59,7 @@ add_executable(o6_command_adapter_node src/o6_command_adapter_node.cpp)
 add_executable(left_hand_test_node src/left_hand_test_node.cpp)
 
 ament_target_dependencies(differential_ik_real_node
-  ament_index_cpp geometry_msgs mit_msgs rclcpp sensor_msgs std_msgs)
+  ament_index_cpp geometry_msgs mit_msgs rclcpp sensor_msgs std_msgs std_srvs)
 target_link_libraries(differential_ik_real_node qiling_dik_real_core pinocchio::pinocchio)
 
 ament_target_dependencies(pose_target_demo

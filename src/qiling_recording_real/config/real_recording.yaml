@@ -6,17 +6,28 @@ output_root: /home/coral/liujun/qiling_television/recordings
 recording:
   storage_id: mcap
   jpeg_quality: 90
-  # The event buttons are rising-edge triggered.
-  start_button: 2       # left Y
-  success_button: 3      # right B
-  failure_button: 1      # right A
+  # All control buttons are rising-edge triggered.
+  # Left Y starts one episode; left X saves it; right A discards it; right B returns home.
+  start_button: 2        # left Y
+  success_button: 0      # left X, marks the current episode successful
+  failure_button: 1      # right A, marks the current episode failed
+  home_button: 3         # right B, requests return to home after X/A
   joy_topic: /xr/controller_joy
+
+home:
+  # Published by qiling_differential_ik and latched with transient-local QoS.
+  state_topic: /teleop/home_state
+  hold_service: /teleop/request_recording_hold
+  request_service: /teleop/request_home
+  ready_value: 3
+  holding_value: 5
+  fault_value: 4
 
 language:
   # Set a non-empty default_task here, or publish a String on language_topic
   # before pressing left Y. The task is stored in LeRobot's canonical task
   # field during conversion.
-  default_task: ""
+  default_task: "Pick up the beverage bottle from the table and place it into the bowl"
   topic: /recording/language
   require_nonempty: true
 

@@ -415,7 +415,8 @@ DDS lowstate → /human_lower_state
 - 闭合/张开目标值；
 - 是否需要位置、速度、力矩或模式字段。
 
-Quest 前方按钮在 `/xr/controller_joy` 中的当前索引为左 Y=`buttons[2]`、右 B=`buttons[3]`。
+Quest 前方按钮和录制按钮在 `/xr/controller_joy` 中的当前索引为左 X=`buttons[0]`、
+右 A=`buttons[1]`、左 Y=`buttons[2]`、右 B=`buttons[3]`。
 O6 仍使用 Trigger，最终输入语义为：
 
 ~~~text
@@ -494,7 +495,8 @@ ros2 topic hz /human_lower_command
 ### 8.6 录制功能
 
 已新增 `qiling_recording_real` 的第一版真机 RGB episode 录制链路。录制器独立于
-遥操控制链，只订阅数据，不发布机器人控制指令。当前配置记录：
+遥操控制链，只订阅数据，并仅通过 IK 服务请求“保持/回 home”，不发布机器人控制指令。
+当前配置记录：
 
 - 头部 D435i、左腕 D405、右腕 D405 的 RGB 图像（640×480@20 Hz，JPEG 压缩）；
 - 双臂实际关节位置；
@@ -503,15 +505,20 @@ ros2 topic hz /human_lower_command
 - O6 目标状态（当前仍没有可用的真实电机反馈话题）；
 - 双臂关节位置目标和末端位姿目标，转换时可选择任一种作为 action；
 - 每个 episode 的语言任务标签；
-- 左 Y 开始录制；
-- 右 B 写入成功事件并停止录制；
-- 右 A 写入失败事件并停止录制。
+- 机器人处于 home/READY 后，左 Y 开始一个 episode；
+- 左 X 标记当前 episode 成功并结束，数据才从 `.pending` 移入正式目录；
+- 右 A 标记当前 episode 失败并结束，临时数据直接删除；
+- 成功/失败后 IK 锁存当前实测姿态；右 B 请求从该姿态直接五次多项式回 home，
+  不经过启动时过渡点；
+- 回 home 完成并重新发布 READY 后，左 Y 才能开始下一条 episode。
 
-每个 episode 的 MCAP 保存压缩 RGB、选定的遥操状态和派生的关节数据；事件写入
+每个 episode 的 MCAP 保存压缩 RGB、选定的遥操状态和派生的关节数据；录制中的 episode
+位于 `recordings/.pending/`，只有成功 episode 才移动到正式目录。事件写入
 `events.jsonl`，配置、相机序列号和任务标签写入 `session.yaml`。录制器只从
 `/human_lower_state`、`/human_lower_command` 提取关节位置/速度和位置目标，不保存
 原始 MIT 消息中的力矩、`kp`、`kd`、`vel` 等底层字段，派生 `JointState.effort` 为空。
-已提供 `convert_to_lerobot.py`，可离线生成 LeRobot Dataset v3；默认主 action 为
+每个成功 episode 独立保存为一个 MCAP 目录；录制中的 episode 位于 `.pending`，失败或
+中断时删除，不进入转换输入。已提供 `convert_to_lerobot.py`，可离线生成 LeRobot Dataset v3；默认主 action 为
 14 维双臂关节位置目标，同时保留末端位姿 action 供后续选择。
 
 ## 9. 按键约定
@@ -528,9 +535,10 @@ ros2 topic hz /human_lower_command
 右手柄前方按钮按住：右 O6 闭合
 右手柄前方按钮松开：右 O6 张开
 
-左 Y：开始录制
-右 B：成功标记并停止录制
-右 A：失败标记并停止录制
+左 Y：home/READY 后开始一个 episode
+左 X：当前 episode 成功并保存
+右 A：当前 episode 失败并删除
+右 B：成功/失败后请求直接回 home
 ~~~
 
 ## 10. 后续实现顺序
@@ -637,7 +645,19 @@ ros2 launch qiling_kinematics_real xr_teleop_real.launch.py
   -> 进入该侧位姿遥操
 ```
 
-真机输出仍为唯一的 26 维 `/human_lower_command`，其中 0..11 为零，12..18
+当前真机 home（弧度，来自示教时的 26 维 `lowstate`；已排除 0..11 腿部数据）为：
+
+```text
+左臂 [0.0104905777,  0.6509880424, -0.1741435826, -1.7084382772,
+      0.0738155171, -0.0963225737, -0.0936522484]
+右臂 [-0.0749599487, -0.6475547552,  0.1073853672, -1.2964446545,
+     -0.0009536889, -0.4251545072,  0.4945830405]
+```
+
+启动阶段的过渡点不变；重复录制流程的回 home 仍从当前实测姿态直接插值到上述
+home，不经过该过渡点。
+
+真机输出仍为唯一的 26 维 `/human_lower_command`，其中 0..11 使用实测腿部位置，12..18
 为左臂，19..25 为右臂。home 阶段只给双臂发布轨迹参考，所有其他命令字段为零；
 O6 由 `o6_trigger_state_node` 独立处理，但在 home 完成前被强制置零。
 
@@ -719,7 +739,8 @@ qiling_recording_real recorder
 - 不记录关节力矩等 MIT 底层字段；
 - 语言任务标签；
 - 时间戳、episode 编号和任务标签；
-- 左 Y 开始；右 B 成功并停止；右 A 失败并停止。
+- 左 Y 在 home/READY 后开始一个 episode；左 X 成功并保存，右 A 失败并删除；随后
+  右 B 请求直接回 home，回到 READY 后再按左 Y 开始下一条。
 
 录制原始的精选 ROS2 数据，不强行在实时控制线程内生成 LeRobot 格式。录制完成后
 使用独立转换脚本生成 LeRobot Dataset v3，并检查图像、状态和 action 的时间对齐。

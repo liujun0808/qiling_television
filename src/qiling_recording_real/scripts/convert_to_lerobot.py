@@ -332,7 +332,6 @@ def main():
     action_mode = str(conversion.get("action_mode", "joint"))
     if action_mode not in ("joint", "eef", "both"):
         raise RuntimeError("action_mode must be joint, eef or both")
-    include_failed = bool(conversion.get("include_failed", True))
     include_alternates = bool(conversion.get("include_alternate_actions", True))
     features = build_features(conversion, joint_names, action_mode, include_alternates)
 
@@ -352,7 +351,11 @@ def main():
     try:
         for episode_dir in episodes:
             status = episode_status(read_events(episode_dir / "events.jsonl"))
-            if status == "failure" and not include_failed:
+            # The recorder only promotes successful episodes out of .pending.
+            # Keep the converter strict as well so legacy interrupted/failure
+            # folders cannot silently enter a VLA dataset.
+            if status != "success":
+                print(f"Skipping {episode_dir.name}: status={status}")
                 continue
             converted.append(
                 convert_episode(

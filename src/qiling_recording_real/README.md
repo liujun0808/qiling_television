@@ -2,14 +2,21 @@
 
 真机 RGB episode 录制包。录制器只订阅话题，不发布任何机器人控制指令。
 
-## 按键
+## 按键与单 episode 流程
 
-- 左 Y：开始新的 episode；只有按键上升沿生效。
-- 右 B：写入成功事件并立即停止当前 episode。
-- 右 A：写入失败事件并立即停止当前 episode。
+所有按键都只响应上升沿。每个 episode 都必须经历“home → 开始 → 成功/失败 → 回
+home”，不会自动开始下一条：
+
+- 机器人处于 READY/home 后，左 Y：开始一个 episode。
+- 录制期间，左 X：标记成功并结束当前 episode；数据才会保存。
+- 录制期间，右 A：标记失败并结束当前 episode；数据被删除，不进入正式目录。
+- 成功/失败后机器人先锁存当前实测姿态，进入保持；右 B：请求从当前姿态直接
+  五次多项式插值回 home，不经过启动时的过渡点。
+- 回 home 期间不录制相机；收到 READY 后，按左 Y 才能开始下一条。
 - 左右 Grip、Trigger：不参与录制控制。
 
-当前 `/xr/controller_joy` 约定为：左 Y=`buttons[2]`、右 B=`buttons[3]`、右 A=`buttons[1]`。
+当前 `/xr/controller_joy` 约定为：左 X=`buttons[0]`、右 A=`buttons[1]`、
+左 Y=`buttons[2]`、右 B=`buttons[3]`。
 
 ## 启动
 
@@ -27,11 +34,15 @@ ros2 launch qiling_kinematics_real xr_teleop_real.launch.py
 ros2 launch qiling_recording_real real_recording.launch.py
 ```
 
-录制器启动后处于 idle 状态。按左 Y 创建 episode；按右 B 或右 A 完成并停止。
+录制器启动后处于 idle 状态。按左 Y 开始一个 episode；成功或失败标记只关闭当前
+episode。成功/失败后按右 B 回 home，回到 READY 后按左 Y 开始下一条。
+
+录制器通过 `/teleop/request_recording_hold` 和 `/teleop/request_home` 调用 IK 节点的
+服务，仅请求状态切换，不发布任何机器人关节控制话题。
 
 ## 语言标签
 
-每个 episode 必须有非空任务描述。可以在按左 Y 之前发布：
+每个 episode 必须有非空任务描述。可以在按左 Y 开始前发布：
 
 ```bash
 ros2 topic pub --once /recording/language std_msgs/msg/String \
@@ -39,8 +50,8 @@ ros2 topic pub --once /recording/language std_msgs/msg/String \
 ```
 
 也可以在 `config/real_recording.yaml` 的 `language.default_task` 中填写固定任务。
-按左 Y 时会把当前任务写入 episode；录制期间再次发布非空字符串也会保留在 MCAP
-中。没有任务标签时，当前配置会拒绝开始录制。
+左 Y 触发时会把当前任务锁存到该 episode；录制期间发布的新语言不会修改当前 episode，
+可作为下一条 episode 的任务。没有任务标签时，当前配置会拒绝开始 episode。
 
 ## 输出
 
@@ -50,10 +61,12 @@ ros2 topic pub --once /recording/language std_msgs/msg/String \
 /home/coral/liujun/qiling_television/recordings/
 ```
 
-每个 episode 的 `rosbag/` 是 MCAP 文件，三路 RGB 以
+录制中的 episode 临时位于 `recordings/.pending/`；只有成功 episode 才会移动到正式目录。
+每个正式 episode 的 `rosbag/` 是 MCAP 文件，三路 RGB 以
 `sensor_msgs/msg/CompressedImage`（JPEG）保存；图像消息保留相机原始 header 时间戳，
 bag 写入时间为本机接收时间。`events.jsonl` 保存开始、成功、失败、停止等事件，
-`session.yaml` 保存序列号、分辨率、频率、按键、任务标签和话题配置。
+`session.yaml` 保存状态、分辨率、频率、按键、任务标签和话题配置。失败/中断 episode
+不会留下正式 episode 目录。
 
 录制的数据字段为：
 
