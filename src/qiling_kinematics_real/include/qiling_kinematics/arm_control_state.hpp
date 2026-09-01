@@ -13,6 +13,10 @@ public:
   explicit ArmControlState(std::string side_name);
 
   void initialize(const ArmVector & measured);
+  // Replace the held/active position reference without changing the current
+  // run state, Grip edge history, or release-required latch. This is used when
+  // the home trajectory hands the command path back to teleoperation.
+  void synchronizeReference(const ArmVector & reference, const std::string & reason);
   void updateGripRequest(bool pressed, const ArmVector & measured);
   void enterHold(
     const ArmVector & measured, bool require_release, const std::string & reason);

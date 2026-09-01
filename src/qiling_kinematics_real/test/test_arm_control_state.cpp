@@ -87,6 +87,51 @@ TEST(ArmControlState, HoldKeepsLatchedReference)
   EXPECT_TRUE(state.previousVelocity().isZero(0.0));
 }
 
+TEST(ArmControlState, SynchronizeReferencePreservesRunStateAndReleaseLatch)
+{
+  ArmControlState state("left");
+  const ArmVector initial = ArmVector::Constant(0.2);
+  state.initialize(initial);
+  state.updateGripRequest(true, initial);
+  ASSERT_TRUE(state.active());
+
+  const ArmVector home = ArmVector::Constant(-0.4);
+  state.synchronizeReference(home, "home handoff");
+  EXPECT_EQ(state.state(), ArmRunState::Active);
+  EXPECT_FALSE(state.releaseRequired());
+  EXPECT_TRUE(state.reference().isApprox(home));
+  EXPECT_TRUE(state.previousVelocity().isZero(0.0));
+
+  state.enterHold(initial, true, "recording boundary");
+  state.synchronizeReference(home, "home handoff while release required");
+  EXPECT_EQ(state.state(), ArmRunState::Hold);
+  EXPECT_TRUE(state.releaseRequired());
+  EXPECT_TRUE(state.reference().isApprox(home));
+  EXPECT_TRUE(state.previousVelocity().isZero(0.0));
+}
+
+TEST(ArmControlState, ReleaseLatchPreservesSynchronizedReference)
+{
+  ArmControlState state("left");
+  const ArmVector initial = ArmVector::Constant(0.2);
+  state.initialize(initial);
+  state.updateGripRequest(true, initial);
+  ASSERT_TRUE(state.active());
+
+  const ArmVector boundary_measured = ArmVector::Constant(0.3);
+  const ArmVector latched_command = ArmVector::Constant(-0.4);
+  state.enterHold(boundary_measured, true, "recording boundary");
+  state.synchronizeReference(latched_command, "latched recording command");
+  ASSERT_TRUE(state.releaseRequired());
+
+  const ArmVector later_measured = ArmVector::Constant(0.5);
+  state.updateGripRequest(false, later_measured);
+  EXPECT_EQ(state.state(), ArmRunState::Hold);
+  EXPECT_FALSE(state.releaseRequired());
+  EXPECT_TRUE(state.reference().isApprox(latched_command));
+  EXPECT_TRUE(state.previousVelocity().isZero(0.0));
+}
+
 TEST(ArmControlState, ActiveReferenceAccumulatesWithMeasuredTrackingBound)
 {
   ArmControlState state("left");
@@ -172,6 +217,42 @@ TEST(ArmControlState, LimitRecoveryOwnsReferenceAcrossGripEdges)
   EXPECT_EQ(state.state(), ArmRunState::Hold);
   EXPECT_FALSE(state.releaseRequired());
   EXPECT_TRUE(state.reference().isApprox(inward));
+}
+
+TEST(ArmControlState, PressedSafetyMarginRecoveryRequiresReleaseBeforeActive)
+{
+  ArmControlState state("right");
+  const ArmVector measured = ArmVector::Constant(0.76);
+  const ArmVector held_reference = ArmVector::Constant(0.75);
+  const ArmVector inward_reference = ArmVector::Constant(0.70);
+  state.initialize(measured);
+  state.synchronizeReference(held_reference, "last held command");
+
+  state.enterLimitRecovery(
+    held_reference, true, "measured position outside ACTIVE safety range");
+  ASSERT_TRUE(state.recovering());
+  EXPECT_TRUE(state.releaseRequired());
+  EXPECT_TRUE(state.reference().isApprox(held_reference));
+
+  state.updateRecoveryReference(inward_reference);
+  state.finishLimitRecovery(true, "joint limit recovery complete");
+  EXPECT_EQ(state.state(), ArmRunState::Hold);
+  EXPECT_TRUE(state.releaseRequired());
+  EXPECT_TRUE(state.reference().isApprox(inward_reference));
+
+  // Keeping Grip pressed must not enter ACTIVE at the recovery boundary.
+  state.updateGripRequest(true, measured);
+  EXPECT_FALSE(state.active());
+  EXPECT_TRUE(state.reference().isApprox(inward_reference));
+
+  state.updateGripRequest(false, measured);
+  EXPECT_FALSE(state.releaseRequired());
+  EXPECT_EQ(state.state(), ArmRunState::Hold);
+  EXPECT_TRUE(state.reference().isApprox(inward_reference));
+
+  state.updateGripRequest(true, measured);
+  EXPECT_TRUE(state.active());
+  EXPECT_TRUE(state.reference().isApprox(inward_reference));
 }
 
 TEST(ArmControlState, ActivationIsRejectedUntilGripRelease)

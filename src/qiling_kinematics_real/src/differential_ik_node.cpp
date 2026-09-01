@@ -189,16 +189,16 @@ ArmVector clampToJointRange(
 }
 
 ArmVector limitRecoveryTarget(
-  const ArmVector & measured, const ArmVector & q_min, const ArmVector & q_max,
+  const ArmVector & reference, const ArmVector & q_min, const ArmVector & q_max,
   double margin)
 {
-  ArmVector target = measured;
+  ArmVector target = reference;
   for (int i = 0; i < kSingleArmDof; ++i) {
     const double safe_margin = std::min(
       std::max(margin, 0.0), 0.5 * (q_max[i] - q_min[i]));
-    if (measured[i] < q_min[i] + safe_margin) {
+    if (reference[i] < q_min[i] + safe_margin) {
       target[i] = q_min[i] + safe_margin;
-    } else if (measured[i] > q_max[i] - safe_margin) {
+    } else if (reference[i] > q_max[i] - safe_margin) {
       target[i] = q_max[i] - safe_margin;
     }
   }
@@ -238,6 +238,7 @@ public:
   {
     declareParameters();
     loadModel();
+    validateLimitRecoveryParameters();
     configureSolvers();
 
     lower_state_sub_ = create_subscription<mit_msgs::msg::MITLowState>(
@@ -397,6 +398,7 @@ private:
     declare_parameter("gravity_compensation_enabled", true);
     declare_parameter("gravity_torque_scale", 1.0);
     declare_parameter("gravity_torque_limit_scale", 1.0);
+    declare_parameter("gravity_transition_duration_sec", 0.50);
 
     declare_parameter("startup_home_enabled", true);
     declare_parameter("home_transition_duration_sec", 2.5);
@@ -458,6 +460,33 @@ private:
     for (int side = 0; side < kSideCount; ++side) {
       if (!computeHomeElbowDirection(home_kinematics[side], minimum_radius, home_elbow_direction_[side])) {
         throw std::runtime_error("unable to compute home elbow swivel direction");
+      }
+    }
+  }
+
+  void validateLimitRecoveryParameters() const
+  {
+    const double active_margin = get_parameter("active_entry_margin_rad").as_double();
+    const double recovery_margin = get_parameter("limit_recovery_margin_rad").as_double();
+    const double recovery_velocity =
+      get_parameter("limit_recovery_max_velocity_rps").as_double();
+    if (!std::isfinite(active_margin) || active_margin < 0.0) {
+      throw std::runtime_error("active_entry_margin_rad must be finite and non-negative");
+    }
+    if (!std::isfinite(recovery_margin) || recovery_margin < active_margin) {
+      throw std::runtime_error(
+              "limit_recovery_margin_rad must be finite and no smaller than "
+              "active_entry_margin_rad");
+    }
+    if (!std::isfinite(recovery_velocity) || recovery_velocity <= 0.0) {
+      throw std::runtime_error("limit_recovery_max_velocity_rps must be finite and positive");
+    }
+    for (int side = 0; side < kSideCount; ++side) {
+      for (int joint = 0; joint < kSingleArmDof; ++joint) {
+        if (2.0 * recovery_margin >= q_max_[side][joint] - q_min_[side][joint]) {
+          throw std::runtime_error(
+                  "limit_recovery_margin_rad leaves no interior range for every arm joint");
+        }
       }
     }
   }
@@ -913,19 +942,25 @@ private:
       return;
     }
 
-    // Do not switch the command reference directly from the active reference
-    // to the measured pose at the episode boundary. X (success) and A
-    // (failure) both arrive here, so this is the common bumpless transition
-    // path for both outcomes.
-    home_hold_start_q_ = {
+    // X (success) and A (failure) both arrive here. A bumpless MIT-control
+    // handoff must preserve the command sent on the previous cycle; preserving
+    // only the measured pose is insufficient because Kp * (pos - measured) is
+    // part of the supporting torque. Hold the exact last published position.
+    home_hold_start_q_ = last_published_command_initialized_ ?
+      last_published_positions_ :
+      std::array<ArmVector, kSideCount>{
       left_control_.reference(), right_control_.reference()};
-    home_hold_target_q_ = measured;
     if (!home_hold_start_q_[kLeftSide].allFinite() ||
       !home_hold_start_q_[kRightSide].allFinite())
     {
-      home_hold_start_q_ = measured;
+      response->success = false;
+      response->message =
+        "recording hold rejected: no finite previously published arm command";
+      RCLCPP_ERROR(get_logger(), "%s", response->message.c_str());
+      return;
     }
-    home_start_q_ = measured;
+    home_hold_target_q_ = home_hold_start_q_;
+    home_start_q_ = home_hold_target_q_;
     home_command_q_ = home_hold_start_q_;
     for (auto & velocity : home_command_qdot_) {
       velocity.setZero();
@@ -934,13 +969,25 @@ private:
     teleop_side_ready_.fill(false);
     left_control_.enterHold(measured[kLeftSide], true, "recording episode boundary");
     right_control_.enterHold(measured[kRightSide], true, "recording episode boundary");
+    // enterHold() establishes the release guard and may temporarily latch the
+    // measurement. Restore the exact command before the next publish; clearing
+    // the release guard later also preserves this reference.
+    left_control_.synchronizeReference(
+      home_hold_target_q_[kLeftSide], "recording command latched");
+    right_control_.synchronizeReference(
+      home_hold_target_q_[kRightSide], "recording command latched");
+    // The robot must remain supported while waiting for the B (return-home)
+    // request.  X/A only changes the recording state; it must not remove the
+    // gravity feedforward and let the arms sag during the recording hold.
+    beginGravityBlend(
+      1.0, std::max(get_parameter("gravity_transition_duration_sec").as_double(), 0.0));
     resetTargetAndGuard(kLeftSide);
     resetTargetAndGuard(kRightSide);
     elbow_geometry_[kLeftSide].reset();
     elbow_geometry_[kRightSide].reset();
     setHomePhase(
       StartupHomePhase::HoldForRecording,
-      "episode ended; smoothly transitioning to measured hold pose");
+      "episode ended; holding last published command");
 
     response->success = true;
     response->message = "recording hold accepted; press home request after marking episode";
@@ -961,25 +1008,38 @@ private:
       return;
     }
 
-    // Start from the command currently being held. Once the short recording
-    // boundary blend has completed, this is exactly the measured hold pose.
-    // Using the current command also keeps B safe if it is pressed quickly,
-    // before the boundary blend has finished.
-    home_start_q_ = home_command_q_;
+    // Start from the command that was actually sent on the previous cycle.
+    // Starting from measured feedback would remove the existing Kp position
+    // error in one frame and create an actuator-torque step.
+    home_start_q_ = last_published_command_initialized_ ?
+      last_published_positions_ : home_command_q_;
     if (!home_start_q_[kLeftSide].allFinite() ||
       !home_start_q_[kRightSide].allFinite())
     {
-      home_start_q_ = measured;
+      home_start_q_ = home_hold_target_q_;
+    }
+    if (!home_start_q_[kLeftSide].allFinite() ||
+      !home_start_q_[kRightSide].allFinite())
+    {
+      response->success = false;
+      response->message = "home request rejected: no finite held arm command";
+      RCLCPP_ERROR(get_logger(), "%s", response->message.c_str());
+      return;
     }
     home_command_q_ = home_start_q_;
     for (auto & velocity : home_command_qdot_) {
       velocity.setZero();
     }
+    // Fade gravity feedforward over the complete direct-home trajectory. The
+    // position trajectory and effort transition therefore share the same
+    // quintic duration instead of removing several N.m in the first 0.5 s.
+    beginGravityBlend(
+      0.0, std::max(get_parameter("home_move_duration_sec").as_double(), 0.1));
     teleop_side_ready_.fill(false);
     setHomePhase(StartupHomePhase::MoveDirectToHome, "direct home requested");
 
     response->success = true;
-    response->message = "direct held-pose to home interpolation started";
+    response->message = "direct held-command to home interpolation started";
     RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
   }
 
@@ -1050,8 +1110,59 @@ private:
     home_phase_ = phase;
     home_phase_time_sec_ = 0.0;
     home_settle_time_sec_ = 0.0;
+    if (phase != StartupHomePhase::Complete && phase != StartupHomePhase::HoldForRecording &&
+      phase != StartupHomePhase::MoveDirectToHome)
+    {
+      resetGravityBlend();
+    }
     RCLCPP_INFO(
       get_logger(), "home phase -> %s (%s)", toString(home_phase_), reason);
+  }
+
+  void resetGravityBlend()
+  {
+    gravity_blend_scale_ = 0.0;
+    gravity_blend_start_scale_ = 0.0;
+    gravity_blend_target_scale_ = 0.0;
+    gravity_blend_elapsed_sec_ = 0.0;
+    gravity_blend_duration_sec_ = 0.0;
+    gravity_blend_active_ = false;
+  }
+
+  void beginGravityBlend(double target_scale, double duration_sec)
+  {
+    const double target = std::clamp(
+      std::isfinite(target_scale) ? target_scale : 0.0, 0.0, 1.0);
+    const double duration =
+      std::isfinite(duration_sec) ? std::max(duration_sec, 0.0) : 0.0;
+    gravity_blend_start_scale_ = std::clamp(gravity_blend_scale_, 0.0, 1.0);
+    gravity_blend_target_scale_ = target;
+    gravity_blend_elapsed_sec_ = 0.0;
+    gravity_blend_duration_sec_ = duration;
+    if (duration <= 0.0 || std::abs(gravity_blend_start_scale_ - target) <= 1.0e-9) {
+      gravity_blend_scale_ = target;
+      gravity_blend_active_ = false;
+    } else {
+      gravity_blend_active_ = true;
+    }
+  }
+
+  void updateGravityBlend(double dt)
+  {
+    if (!gravity_blend_active_) {
+      return;
+    }
+    const double safe_dt = std::isfinite(dt) && dt > 0.0 ? dt : 0.0;
+    gravity_blend_elapsed_sec_ += safe_dt;
+    const double u = std::clamp(
+      gravity_blend_elapsed_sec_ / gravity_blend_duration_sec_, 0.0, 1.0);
+    const double smooth = u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
+    gravity_blend_scale_ = gravity_blend_start_scale_ +
+      smooth * (gravity_blend_target_scale_ - gravity_blend_start_scale_);
+    if (u >= 1.0) {
+      gravity_blend_scale_ = gravity_blend_target_scale_;
+      gravity_blend_active_ = false;
+    }
   }
 
   void beginStartupHome(const std::array<ArmVector, kSideCount> & measured)
@@ -1065,6 +1176,7 @@ private:
     home_hold_target_q_ = measured;
     home_handoff_start_q_ = measured;
     home_handoff_target_q_ = measured;
+    resetGravityBlend();
     for (auto & velocity : home_command_qdot_) {
       velocity.setZero();
     }
@@ -1080,6 +1192,8 @@ private:
       if (!right_control_.initialized()) {
         right_control_.initialize(home_q_[kRightSide]);
       }
+      beginGravityBlend(
+        1.0, std::max(get_parameter("gravity_transition_duration_sec").as_double(), 0.0));
       setHomePhase(StartupHomePhase::Complete, "startup home disabled");
       home_complete_ = true;
     }
@@ -1198,10 +1312,18 @@ private:
           // state on the next tick, so normal Hold cannot create a step.
           if (!left_control_.initialized()) {
             left_control_.initialize(home_handoff_target_q_[kLeftSide]);
+          } else {
+            left_control_.synchronizeReference(
+              home_handoff_target_q_[kLeftSide], "home handoff reference synchronized");
           }
           if (!right_control_.initialized()) {
             right_control_.initialize(home_handoff_target_q_[kRightSide]);
+          } else {
+            right_control_.synchronizeReference(
+              home_handoff_target_q_[kRightSide], "home handoff reference synchronized");
           }
+          beginGravityBlend(
+            1.0, std::max(get_parameter("gravity_transition_duration_sec").as_double(), 0.0));
           home_complete_ = true;
           setHomePhase(StartupHomePhase::Complete, "home-to-teleop handoff finished");
           RCLCPP_INFO(
@@ -1335,8 +1457,12 @@ private:
         return;
       }
 
+      // Keep unrelated joints at their held reference. Only references that
+      // are themselves near/outside a limit are moved into the recovery zone.
+      // If an unsafe measured joint already has a safe held reference, waiting
+      // for feedback to follow that reference avoids an unnecessary pose step.
       const ArmVector target_reference = limitRecoveryTarget(
-        measured, q_min, q_max, recovery_margin);
+        control.reference(), q_min, q_max, recovery_margin);
       const ArmVector next_reference = moveReferenceTowards(
         control.reference(), target_reference, recovery_velocity * dt);
       control.updateRecoveryReference(next_reference);
@@ -1384,14 +1510,22 @@ private:
     }
 
     // Check the measured state before updateGripRequest can create ACTIVE.
-    // A controller press near a hard limit is latched as a rejected Hold and
-    // requires a release/re-press after the arm has returned to the safe zone.
+    // If feedback is still inside the URDF hard range but outside the ACTIVE
+    // safety margin, recover the held reference into the interior at the same
+    // bounded speed used for a hard-limit recovery. Recovery starts only from
+    // an explicit Grip request, so an idle Hold never moves autonomously.
     if (requested_active && control.state() == ArmRunState::Hold &&
       !control.releaseRequired() && !insideJointSafetyRange(
         measured, q_min, q_max, active_entry_margin))
     {
-      control.rejectActivation(
-        true, measured, "ACTIVE rejected: measured joint is outside safety range");
+      // Preserve the last published Hold command as the first recovery command
+      // to keep this boundary bumpless. It is clamped only to the URDF hard
+      // range; subsequent cycles move it toward the configured interior zone.
+      const ArmVector initial_reference = clampToJointRange(
+        control.reference(), q_min, q_max);
+      control.enterLimitRecovery(
+        initial_reference, true,
+        "measured position outside ACTIVE safety range; limit recovery");
       resetTargetAndGuard(side);
       elbow_geometry_[side].reset();
       diagnostics.solver_status = SolverStatus::InvalidBounds;
@@ -1399,12 +1533,18 @@ private:
         minJointLimitDistance(measured, q_min, q_max);
       diagnostics.qdot.setZero();
       diagnostics.command_held = true;
+      const ArmVector target_reference = limitRecoveryTarget(
+        initial_reference, q_min, q_max, recovery_margin);
       RCLCPP_WARN(
         get_logger(),
-        "%s ACTIVE rejected before activation: measured=%s "
-        "safety_margin=%.4f urdf_range=[%s, %s]; release and re-press Grip",
-        side_name, formatArmVector(measured).c_str(), active_entry_margin,
-        formatArmVector(q_min).c_str(), formatArmVector(q_max).c_str());
+        "%s entered LIMIT_RECOVERY before ACTIVE: measured=%s reference=%s "
+        "inward_target=%s safety_margin=%.4f recovery_margin=%.4f "
+        "max_velocity=%.4f urdf_range=[%s, %s]; teleoperation remains disabled",
+        side_name, formatArmVector(measured).c_str(),
+        formatArmVector(initial_reference).c_str(),
+        formatArmVector(target_reference).c_str(), active_entry_margin,
+        recovery_margin, recovery_velocity, formatArmVector(q_min).c_str(),
+        formatArmVector(q_max).c_str());
       finishArmCycle(side_name, previous_state, control, diagnostics);
       return;
     }
@@ -1704,6 +1844,7 @@ private:
     const bool control_stalled =
       !std::isfinite(raw_dt) ||
       raw_dt > get_parameter("control_stall_fault_sec").as_double();
+    updateGravityBlend(dt);
 
     std::array<ArmVector, kSideCount> q_snapshot;
     std::array<double, kLegMotorCount> leg_q_snapshot;
@@ -1771,7 +1912,8 @@ private:
           for (auto & velocity : home_command_qdot_) {
             velocity.setZero();
           }
-          publishCommand(leg_q_snapshot, home_command_q_, home_command_qdot_);
+          publishCommand(
+            leg_q_snapshot, q_snapshot, home_command_q_, home_command_qdot_);
         }
         return;
       }
@@ -1779,7 +1921,8 @@ private:
         beginStartupHome(q_snapshot);
       }
       updateStartupHome(q_snapshot, dt);
-      publishCommand(leg_q_snapshot, home_command_q_, home_command_qdot_);
+      publishCommand(
+        leg_q_snapshot, q_snapshot, home_command_q_, home_command_qdot_);
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), get_parameter("home_log_period_ms").as_int(),
         "home phase=%s error=%.4f rad", toString(home_phase_),
@@ -1811,7 +1954,7 @@ private:
       control_stalled, dt, right_control_, *right_solver_, right_diagnostics_);
 
     if (left_control_.initialized() && right_control_.initialized()) {
-      publishCommand(leg_q_snapshot);
+      publishCommand(leg_q_snapshot, q_snapshot);
     } else {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
@@ -1819,17 +1962,20 @@ private:
     }
   }
 
-  void publishCommand(const std::array<double, kLegMotorCount> & leg_positions)
+  void publishCommand(
+    const std::array<double, kLegMotorCount> & leg_positions,
+    const std::array<ArmVector, kSideCount> & measured)
   {
     const std::array<ArmVector, kSideCount> references = {
       left_control_.reference(), right_control_.reference()};
     const std::array<ArmVector, kSideCount> velocities = {
       ArmVector::Zero(), ArmVector::Zero()};
-    publishCommand(leg_positions, references, velocities);
+    publishCommand(leg_positions, measured, references, velocities);
   }
 
   void publishCommand(
     const std::array<double, kLegMotorCount> & leg_positions,
+    const std::array<ArmVector, kSideCount> & measured,
     const std::array<ArmVector, kSideCount> & references,
     const std::array<ArmVector, kSideCount> & velocities)
   {
@@ -1853,6 +1999,13 @@ private:
       command.commands[i].pos = static_cast<float>(leg_positions[i]);
     }
 
+    const std::array<ArmVector, kSideCount> control_references = {
+      left_control_.reference(), right_control_.reference()};
+    std::array<ArmVector, kSideCount> efforts;
+    for (auto & effort : efforts) {
+      effort.setZero();
+    }
+
     for (int i = 0; i < kSingleArmDof; ++i) {
       command.commands[kLeftArmCommandOffset + i].kp = kp;
       command.commands[kLeftArmCommandOffset + i].kd = kd;
@@ -1860,8 +2013,9 @@ private:
         static_cast<float>(references[kLeftSide][i]);
       command.commands[kLeftArmCommandOffset + i].vel =
         static_cast<float>(velocities[kLeftSide][i]);
+      efforts[kLeftSide][i] = gravityFeedforward(kLeftSide, i);
       command.commands[kLeftArmCommandOffset + i].eff = static_cast<float>(
-        gravityFeedforward(kLeftSide, i));
+        efforts[kLeftSide][i]);
 
       command.commands[kRightArmCommandOffset + i].kp = kp;
       command.commands[kRightArmCommandOffset + i].kd = kd;
@@ -1869,26 +2023,88 @@ private:
         static_cast<float>(references[kRightSide][i]);
       command.commands[kRightArmCommandOffset + i].vel =
         static_cast<float>(velocities[kRightSide][i]);
+      efforts[kRightSide][i] = gravityFeedforward(kRightSide, i);
       command.commands[kRightArmCommandOffset + i].eff = static_cast<float>(
-        gravityFeedforward(kRightSide, i));
+        efforts[kRightSide][i]);
     }
 
+    logCommandBoundary(measured, control_references, references, velocities, efforts);
     command_pub_->publish(command);
+    last_published_positions_ = references;
+    last_published_velocities_ = velocities;
+    last_published_efforts_ = efforts;
+    last_published_command_initialized_ = true;
+  }
+
+  void logCommandBoundary(
+    const std::array<ArmVector, kSideCount> & measured,
+    const std::array<ArmVector, kSideCount> & control_references,
+    const std::array<ArmVector, kSideCount> & positions,
+    const std::array<ArmVector, kSideCount> & velocities,
+    const std::array<ArmVector, kSideCount> & efforts)
+  {
+    const std::array<ArmRunState, kSideCount> states = {
+      left_control_.state(), right_control_.state()};
+    const bool phase_changed = !command_log_initialized_ ||
+      home_phase_ != last_command_phase_;
+    const bool state_changed = !command_log_initialized_ || states != last_command_states_;
+    const bool blend_changed = !command_log_initialized_ ||
+      gravity_blend_active_ != last_command_gravity_blend_active_;
+    if (phase_changed || state_changed || blend_changed) {
+      const double kp = get_parameter("command_kp").as_double();
+      const double kd = get_parameter("command_kd").as_double();
+      for (int side = 0; side < kSideCount; ++side) {
+        ArmVector delta_position = ArmVector::Zero();
+        ArmVector delta_velocity = ArmVector::Zero();
+        ArmVector delta_effort = ArmVector::Zero();
+        if (last_published_command_initialized_) {
+          delta_position = positions[side] - last_published_positions_[side];
+          delta_velocity = velocities[side] - last_published_velocities_[side];
+          delta_effort = efforts[side] - last_published_efforts_[side];
+        }
+        const ArmVector delta_command_torque =
+          kp * delta_position + kd * delta_velocity + delta_effort;
+        RCLCPP_INFO(
+          get_logger(),
+          "command boundary side=%s home_phase=%s home_complete=%s control_state=%s "
+          "gravity_blend=%.3f blend_active=%s previous=%s q_measured=%s q_ref=%s "
+          "pos=%s vel=%s eff=%s dpos=%s dvel=%s deff=%s dtau_cmd=%s",
+          side == kLeftSide ? "left" : "right", toString(home_phase_),
+          home_complete_ ? "true" : "false", qiling_kinematics::toString(states[side]),
+          gravity_blend_scale_, gravity_blend_active_ ? "true" : "false",
+          last_published_command_initialized_ ? "true" : "false",
+          formatArmVector(measured[side]).c_str(),
+          formatArmVector(control_references[side]).c_str(),
+          formatArmVector(positions[side]).c_str(),
+          formatArmVector(velocities[side]).c_str(),
+          formatArmVector(efforts[side]).c_str(),
+          formatArmVector(delta_position).c_str(),
+          formatArmVector(delta_velocity).c_str(),
+          formatArmVector(delta_effort).c_str(),
+          formatArmVector(delta_command_torque).c_str());
+      }
+    }
+    command_log_initialized_ = true;
+    last_command_phase_ = home_phase_;
+    last_command_states_ = states;
+    last_command_gravity_blend_active_ = gravity_blend_active_;
   }
 
   double gravityFeedforward(int side, int joint) const
   {
-    if (!get_parameter("gravity_compensation_enabled").as_bool() ||
-      home_phase_ != StartupHomePhase::Complete || side < 0 || side >= kSideCount ||
+    const bool gravity_phase = home_phase_ == StartupHomePhase::Complete ||
+      home_phase_ == StartupHomePhase::HoldForRecording ||
+      home_phase_ == StartupHomePhase::MoveDirectToHome;
+    if (!get_parameter("gravity_compensation_enabled").as_bool() || !gravity_phase ||
+      gravity_blend_scale_ <= 0.0 || side < 0 || side >= kSideCount ||
       joint < 0 || joint >= kSingleArmDof)
     {
       return 0.0;
     }
 
-    // Gravity feedforward is intentionally restricted to normal teleoperation
-    // after the complete home-to-teleop handoff. Startup home, recording hold,
-    // direct return home, settling, and the smooth handoff all use position
-    // control only. This also keeps FAULT torque-free.
+    // Gravity feedforward is used during normal teleoperation and recording
+    // hold. At B it is faded over the complete direct-home trajectory;
+    // startup home, settling, the smooth handoff, and FAULT remain torque-free.
     const ArmControlState & control = side == kLeftSide ? left_control_ : right_control_;
     if (control.state() == ArmRunState::Fault) {
       return 0.0;
@@ -1897,7 +2113,7 @@ private:
     const double scale = get_parameter("gravity_torque_scale").as_double();
     const double limit_scale = get_parameter("gravity_torque_limit_scale").as_double();
     const double effort_limit = effort_limits_[side][joint];
-    const double torque = scale * gravity_torques_[side][joint];
+    const double torque = gravity_blend_scale_ * scale * gravity_torques_[side][joint];
     if (!std::isfinite(scale) || !std::isfinite(limit_scale) ||
       scale < 0.0 || limit_scale < 0.0 || !std::isfinite(torque) ||
       !std::isfinite(effort_limit) || effort_limit <= 0.0)
@@ -1952,6 +2168,9 @@ private:
   std::array<ArmVector, kSideCount> home_command_qdot_{};
   std::array<ArmVector, kSideCount> gravity_torques_{};
   std::array<ArmVector, kSideCount> effort_limits_{};
+  std::array<ArmVector, kSideCount> last_published_positions_{};
+  std::array<ArmVector, kSideCount> last_published_velocities_{};
+  std::array<ArmVector, kSideCount> last_published_efforts_{};
   std::array<Eigen::Vector3d, kSideCount> home_elbow_direction_{};
   std::array<TimedTarget, kSideCount> filtered_targets_{};
   std::array<bool, kSideCount> filtered_target_valid_{};
@@ -1982,6 +2201,18 @@ private:
   bool home_complete_{false};
   double home_phase_time_sec_{0.0};
   double home_settle_time_sec_{0.0};
+  double gravity_blend_scale_{0.0};
+  double gravity_blend_start_scale_{0.0};
+  double gravity_blend_target_scale_{0.0};
+  double gravity_blend_elapsed_sec_{0.0};
+  double gravity_blend_duration_sec_{0.0};
+  bool gravity_blend_active_{false};
+  bool command_log_initialized_{false};
+  bool last_published_command_initialized_{false};
+  StartupHomePhase last_command_phase_{StartupHomePhase::WaitingForState};
+  std::array<ArmRunState, kSideCount> last_command_states_{
+    ArmRunState::Hold, ArmRunState::Hold};
+  bool last_command_gravity_blend_active_{false};
 
   rclcpp::Subscription<mit_msgs::msg::MITLowState>::SharedPtr lower_state_sub_;
   rclcpp::Subscription<PoseMsg>::SharedPtr left_target_sub_;

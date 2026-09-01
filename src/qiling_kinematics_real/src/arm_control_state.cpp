@@ -26,6 +26,17 @@ void ArmControlState::initialize(const ArmVector & measured)
   resetMotion(measured);
 }
 
+void ArmControlState::synchronizeReference(
+  const ArmVector & reference, const std::string & reason)
+{
+  if (!initialized_ || !reference.allFinite()) {
+    return;
+  }
+  reference_ = reference;
+  previous_velocity_.setZero();
+  reason_ = reason;
+}
+
 void ArmControlState::updateGripRequest(bool pressed, const ArmVector & measured)
 {
   if (!initialized_ || !measured.allFinite()) {
@@ -46,14 +57,25 @@ void ArmControlState::updateGripRequest(bool pressed, const ArmVector & measured
   grip_pressed_ = pressed;
 
   if (!pressed) {
-    if (state_ == ArmRunState::Fault || release_required_) {
+    if (state_ == ArmRunState::Fault) {
       state_ = ArmRunState::Hold;
       release_required_ = false;
       consecutive_solve_failures_ = 0;
       reason_ = "Grip released";
-      // A fault/recovery transition must re-synchronize with the measured
-      // state before accepting another active command.
+      // A fault invalidates the previous command reference. Re-synchronize
+      // with feedback before accepting another active command.
       resetMotion(measured);
+    } else if (release_required_) {
+      state_ = ArmRunState::Hold;
+      release_required_ = false;
+      consecutive_solve_failures_ = 0;
+      reason_ = "Grip released";
+      // A non-fault release latch is only an input-edge guard. The reference
+      // has already been selected by the transition that requested release
+      // (recording hold, timeout, activation rejection, or limit recovery).
+      // Replacing it with a later measured pose here would create a second,
+      // hidden command step after an otherwise continuous handoff.
+      previous_velocity_.setZero();
     } else if (falling_edge) {
       state_ = ArmRunState::Hold;
       consecutive_solve_failures_ = 0;
