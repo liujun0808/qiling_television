@@ -31,6 +31,11 @@ def _launch_nodes(context):
         )
         color_profile = f"{width}x{height}x{fps}"
         parameters = {
+            # RealSense ROS uses these parameters when constructing the
+            # camera topic namespace.  The ROS Node name/namespace below do
+            # not replace the driver's camera_name/camera_namespace params.
+            "camera_name": camera["camera_name"],
+            "camera_namespace": camera["camera_namespace"],
             "serial_no": camera["serial"],
             "enable_color": True,
             "enable_depth": False,

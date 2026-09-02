@@ -65,8 +65,13 @@ ros2 topic pub --once /recording/language std_msgs/msg/String \
 每个正式 episode 的 `rosbag/` 是 MCAP 文件，三路 RGB 以
 `sensor_msgs/msg/CompressedImage`（JPEG）保存；图像消息保留相机原始 header 时间戳，
 bag 写入时间为本机接收时间。`events.jsonl` 保存开始、成功、失败、停止等事件，
-`session.yaml` 保存状态、分辨率、频率、按键、任务标签和话题配置。失败/中断 episode
-不会留下正式 episode 目录。
+`session.yaml` 保存状态、分辨率、频率、按键、任务标签、话题配置以及每路相机的
+接收/压缩/写入/丢帧计数。失败/中断 episode 不会留下正式 episode 目录。
+
+三路相机使用独立的有界队列和 JPEG 工作线程；ROS 图像回调只负责更新输入新鲜度并
+把最新帧放入队列，避免压缩工作阻塞遥操和关节状态回调。按左 Y 前要求三路相机最近
+0.5 秒内均收到图像。录制期间每 2 秒会打印每路相机的 `recv/enc/write/drop/error`
+统计；当前只记录统计，不会因为实际图像频率低于某个阈值而拒绝保存成功 episode。
 
 录制的数据字段为：
 
@@ -106,5 +111,6 @@ Dataset v3 的 LeRobot；转换器不会自动安装依赖。
 - 左手 D405：`352122273604`
 - 右手 D405：`409122273836`
 
-三路相机均配置为 RGB 640×480@20 Hz，关闭深度、红外和 IMU。若某台设备实际不接受
-该 profile，RealSense 节点会在启动日志中报告 profile 错误，不会静默改用其他频率。
+头部 D435i 配置为 RGB 1280×720@30 Hz，左右手 D405 配置为 RGB 848×480@30 Hz；
+三路均关闭深度、红外和 IMU。若某台设备实际不接受该 profile，RealSense 节点会在
+启动日志中报告 profile 错误，不会静默改用其他频率。

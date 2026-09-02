@@ -6,6 +6,16 @@ output_root: /home/coral/liujun/qiling_television/recordings
 recording:
   storage_id: mcap
   jpeg_quality: 90
+  # Keep robot state close to the 50 Hz controller rate instead of writing
+  # the roughly 800 Hz low-level feedback stream into every episode.
+  observation_rate_hz: 50.0
+  # An episode can start only when every RGB input has produced a recent frame.
+  camera_timeout_sec: 0.5
+  # Each camera callback only enqueues the newest frames; JPEG work runs in a
+  # dedicated worker so camera traffic cannot block robot-state callbacks.
+  image_queue_depth: 2
+  executor_threads: 4
+  camera_diagnostics_period_sec: 2.0
   # All control buttons are rising-edge triggered.
   # Left Y starts one episode; left X saves it; right A discards it; right B returns home.
   start_button: 2        # left Y
@@ -40,7 +50,7 @@ cameras:
     height: 720
     fps: 30
     color_format: RGB8
-    image_topic: /camera_head/color/image_raw
+    image_topic: /camera_head/head_camera/color/image_raw
     recorded_topic: /recording/rgb/head
   left:
     serial: "352122273604"
@@ -50,7 +60,7 @@ cameras:
     height: 480
     fps: 30
     color_format: RGB8
-    image_topic: /camera_left/color/image_raw
+    image_topic: /camera_left/left_camera/color/image_raw
     recorded_topic: /recording/rgb/left
   right:
     serial: "409122273836"
@@ -60,7 +70,7 @@ cameras:
     height: 480
     fps: 30
     color_format: RGB8
-    image_topic: /camera_right/color/image_raw
+    image_topic: /camera_right/right_camera/color/image_raw
     recorded_topic: /recording/rgb/right
 
 stream:

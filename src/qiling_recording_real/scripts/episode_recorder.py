@@ -14,6 +14,7 @@ import copy
 import datetime as dt
 import json
 from pathlib import Path
+from queue import Empty, Full, Queue
 import shutil
 import threading
 import time
@@ -21,6 +22,8 @@ import time
 import cv2
 from cv_bridge import CvBridge, CvBridgeError
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
@@ -59,6 +62,18 @@ class EpisodeRecorder(Node):
         self.success_button = int(recording.get("success_button", 0))
         self.failure_button = int(recording.get("failure_button", 1))
         self.home_button = int(recording.get("home_button", 3))
+        self.observation_rate_hz = max(
+            1.0, float(recording.get("observation_rate_hz", 50.0)))
+        self.observation_period_ns = int(1e9 / self.observation_rate_hz)
+        self.camera_timeout_sec = max(
+            0.1, float(recording.get("camera_timeout_sec", 0.5)))
+        self.camera_timeout_ns = int(self.camera_timeout_sec * 1e9)
+        self.image_queue_depth = max(
+            1, int(recording.get("image_queue_depth", 2)))
+        self.executor_threads = max(
+            4, int(recording.get("executor_threads", 4)))
+        self.camera_diagnostics_period_sec = max(
+            0.5, float(recording.get("camera_diagnostics_period_sec", 2.0)))
 
         home = self.config.get("home", {})
         self.home_state_topic = str(home.get("state_topic", "/teleop/home_state"))
@@ -93,6 +108,8 @@ class EpisodeRecorder(Node):
             raise RuntimeError("derived_topics.joint_names must contain 14 arm joint names")
 
         self.cameras = self.config.get("cameras", {})
+        if not self.cameras:
+            raise RuntimeError("at least one RGB camera must be configured")
         self.topic_specs = [
             (str(spec["name"]), str(spec["type"]))
             for spec in self.config.get("topics", [])
@@ -104,6 +121,8 @@ class EpisodeRecorder(Node):
         self._episode_dir = None
         self._episode_name = ""
         self._episode_task = ""
+        self._episode_generation = 0
+        self._episode_started_ns = 0
         self._active = False
         self._waiting_for_home = False
         self._hold_request_pending = False
@@ -111,9 +130,24 @@ class EpisodeRecorder(Node):
         self._home_request_pending = False
         self._home_state_code = 0
         self._last_buttons = []
-        self._bridge = CvBridge()
+        self._last_observation_write_ns = 0
         self._image_subscriptions = []
         self._topic_subscriptions = []
+        self._camera_callback_groups = {}
+        self._camera_diagnostic_callback_group = MutuallyExclusiveCallbackGroup()
+        self._camera_last_seen_ns = {
+            camera_name: 0 for camera_name in self.cameras
+        }
+        self._camera_stats = self._empty_camera_stats()
+        self._image_queues = {
+            camera_name: Queue(maxsize=self.image_queue_depth)
+            for camera_name in self.cameras
+        }
+        self._camera_bridges = {
+            camera_name: CvBridge() for camera_name in self.cameras
+        }
+        self._camera_worker_stop = threading.Event()
+        self._camera_workers = []
 
         self._joy_subscription = self.create_subscription(
             Joy, self.joy_topic, self._joy_callback, qos_profile_sensor_data)
@@ -137,14 +171,22 @@ class EpisodeRecorder(Node):
         self._command_subscription = self.create_subscription(
             MITJointCommands, self.command_topic, self._command_callback, qos_profile_sensor_data)
 
+        camera_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         for camera_name, camera in self.cameras.items():
             image_topic = str(camera["image_topic"])
+            callback_group = MutuallyExclusiveCallbackGroup()
+            self._camera_callback_groups[camera_name] = callback_group
             self._image_subscriptions.append(
                 self.create_subscription(
                     Image,
                     image_topic,
                     lambda message, name=camera_name: self._image_callback(name, message),
-                    qos_profile_sensor_data,
+                    camera_qos,
+                    callback_group=callback_group,
                 )
             )
 
@@ -173,6 +215,13 @@ class EpisodeRecorder(Node):
                 )
             )
 
+        self._camera_diagnostics_timer = self.create_timer(
+            self.camera_diagnostics_period_sec,
+            self._camera_diagnostics_callback,
+            callback_group=self._camera_diagnostic_callback_group,
+        )
+        self._start_camera_workers()
+
         self.get_logger().info(
             "Episode recorder ready: left Y starts one episode; left X saves success; "
             "right A discards failure; right B requests direct return to home")
@@ -193,11 +242,154 @@ class EpisodeRecorder(Node):
         )
         self.get_logger().info(
             f"RGB cameras={len(self.cameras)}, profiles={camera_profiles}, "
-            f"resize=disabled, output={self.output_root}")
+            f"resize=disabled, QoS=RELIABLE/KEEP_LAST(1), "
+            f"queue_depth={self.image_queue_depth}, workers={len(self._camera_workers)}, "
+            f"executor_threads={self.executor_threads}, output={self.output_root}")
+        self.get_logger().info(
+            f"Observation recording limited to {self.observation_rate_hz:.1f} Hz; "
+            f"camera freshness timeout={self.camera_timeout_sec:.2f}s; "
+            "camera frame-rate validation on success is disabled")
 
     @staticmethod
     def _wall_time_string():
         return dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+    def _empty_camera_stats(self):
+        return {
+            camera_name: {
+                "received": 0,
+                "enqueued": 0,
+                "encoded": 0,
+                "written": 0,
+                "dropped_queue": 0,
+                "dropped_stale": 0,
+                "encode_errors": 0,
+                "write_errors": 0,
+            }
+            for camera_name in self.cameras
+        }
+
+    def _start_camera_workers(self):
+        for camera_name in self.cameras:
+            worker = threading.Thread(
+                target=self._camera_worker,
+                args=(camera_name,),
+                name=f"qiling_rgb_{camera_name}_worker",
+                daemon=True,
+            )
+            worker.start()
+            self._camera_workers.append(worker)
+
+    def _stop_camera_workers(self):
+        self._camera_worker_stop.set()
+        for worker in self._camera_workers:
+            worker.join(timeout=2.0)
+            if worker.is_alive():
+                self.get_logger().warning(
+                    f"Camera worker did not stop within timeout: {worker.name}")
+
+    def _camera_worker(self, camera_name):
+        image_queue = self._image_queues[camera_name]
+        bridge = self._camera_bridges[camera_name]
+
+        while not self._camera_worker_stop.is_set():
+            try:
+                episode_generation, message, receive_time_ns = image_queue.get(timeout=0.1)
+            except Empty:
+                continue
+
+            try:
+                with self._lock:
+                    current_episode = (
+                        self._active
+                        and self._writer is not None
+                        and episode_generation == self._episode_generation
+                    )
+                    if (
+                        not current_episode
+                        and episode_generation == self._episode_generation
+                    ):
+                        self._camera_stats[camera_name]["dropped_stale"] += 1
+                if not current_episode:
+                    continue
+
+                try:
+                    image = bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
+                    success, encoded = cv2.imencode(
+                        ".jpg",
+                        image,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality],
+                    )
+                    if not success:
+                        raise RuntimeError("cv2.imencode returned false")
+                except (CvBridgeError, RuntimeError, ValueError, cv2.error) as error:
+                    with self._lock:
+                        if episode_generation == self._episode_generation:
+                            stats = self._camera_stats[camera_name]
+                            stats["encode_errors"] += 1
+                            error_count = stats["encode_errors"]
+                        else:
+                            error_count = 0
+                    if error_count == 1 or (error_count > 0 and error_count % 100 == 0):
+                        self.get_logger().warning(
+                            f"Failed to encode {camera_name} RGB frame "
+                            f"(count={error_count}): {error}")
+                    continue
+
+                compressed = CompressedImage()
+                compressed.header = message.header
+                compressed.format = "jpeg"
+                compressed.data = encoded.tobytes()
+
+                with self._lock:
+                    stats = self._camera_stats[camera_name]
+                    current_episode = (
+                        self._active
+                        and self._writer is not None
+                        and episode_generation == self._episode_generation
+                    )
+                    if not current_episode:
+                        if episode_generation == self._episode_generation:
+                            stats["dropped_stale"] += 1
+                        continue
+                    stats["encoded"] += 1
+                    try:
+                        self._write_bag_message_locked(
+                            str(self.cameras[camera_name]["recorded_topic"]),
+                            compressed,
+                            receive_time_ns,
+                        )
+                        stats["written"] += 1
+                    except Exception as error:  # Keep the worker alive and expose storage failures.
+                        stats["write_errors"] += 1
+                        error_count = stats["write_errors"]
+                        if error_count == 1 or error_count % 100 == 0:
+                            self.get_logger().error(
+                                f"Failed to write {camera_name} RGB frame "
+                                f"(count={error_count}): {error}")
+            finally:
+                image_queue.task_done()
+
+    def _camera_diagnostics_callback(self):
+        now_ns = self.get_clock().now().nanoseconds
+        with self._lock:
+            if not self._active:
+                return
+            elapsed_sec = max((now_ns - self._episode_started_ns) / 1e9, 1e-6)
+            stats = copy.deepcopy(self._camera_stats)
+
+        reports = []
+        for camera_name, camera_stats in stats.items():
+            reports.append(
+                f"{camera_name}: recv={camera_stats['received']} "
+                f"enc={camera_stats['encoded']} write={camera_stats['written']} "
+                f"drop_q={camera_stats['dropped_queue']} "
+                f"drop_stale={camera_stats['dropped_stale']} "
+                f"err={camera_stats['encode_errors'] + camera_stats['write_errors']} "
+                f"write_hz={camera_stats['written'] / elapsed_sec:.1f} "
+                f"q={self._image_queues[camera_name].qsize()}"
+            )
+        self.get_logger().info("RGB episode stats | " + " | ".join(reports))
 
     @staticmethod
     def _button_pressed(message, index):
@@ -293,18 +485,34 @@ class EpisodeRecorder(Node):
                 "format": "jpeg",
                 "quality": self.jpeg_quality,
                 "timestamp_policy": "header stamp preserved; bag stamp is local receive time",
+                "input_qos": "RELIABLE/KEEP_LAST(1)",
+                "queue_depth_per_camera": self.image_queue_depth,
+                "worker_count": len(self._camera_workers),
+                "frame_rate_validation_on_success": False,
+            },
+            "recording_runtime": {
+                "executor_threads": self.executor_threads,
+                "observation_rate_hz": self.observation_rate_hz,
+                "camera_timeout_sec": self.camera_timeout_sec,
+                "camera_diagnostics_period_sec": self.camera_diagnostics_period_sec,
             },
         }
         with (episode_dir / "session.yaml").open("w", encoding="utf-8") as stream:
             yaml.safe_dump(session, stream, allow_unicode=True, sort_keys=False)
 
     @staticmethod
-    def _update_session_result(episode_dir, status, saved):
+    def _update_session_result(
+        episode_dir, status, saved, duration_sec=None, camera_stats=None
+    ):
         session_path = episode_dir / "session.yaml"
         with session_path.open("r", encoding="utf-8") as stream:
             session = yaml.safe_load(stream) or {}
         session["status"] = status
         session["saved"] = bool(saved)
+        if duration_sec is not None:
+            session["duration_sec"] = float(duration_sec)
+        if camera_stats is not None:
+            session["camera_stats"] = copy.deepcopy(camera_stats)
         with session_path.open("w", encoding="utf-8") as stream:
             yaml.safe_dump(session, stream, allow_unicode=True, sort_keys=False)
 
@@ -445,6 +653,23 @@ class EpisodeRecorder(Node):
                     f"expected READY={self.home_ready_code}")
                 return False
 
+            now_ns = self.get_clock().now().nanoseconds
+            stale_cameras = []
+            for camera_name, last_seen_ns in self._camera_last_seen_ns.items():
+                if last_seen_ns <= 0:
+                    stale_cameras.append(f"{camera_name}=never")
+                    continue
+                age_ns = now_ns - last_seen_ns
+                if age_ns > self.camera_timeout_ns:
+                    age_sec = age_ns / 1e9
+                    stale_cameras.append(f"{camera_name}={age_sec:.3f}s")
+            if stale_cameras:
+                self.get_logger().error(
+                    "Recording start rejected because RGB input is stale: "
+                    + ", ".join(stale_cameras)
+                )
+                return False
+
             task = self.current_task.strip()
             if self.require_task and not task:
                 self.get_logger().error(
@@ -498,6 +723,10 @@ class EpisodeRecorder(Node):
             self._episode_name = episode_name
             self._event_file = (episode_dir / "events.jsonl").open("w", encoding="utf-8")
             self._episode_task = task
+            self._episode_generation += 1
+            self._episode_started_ns = started_ns
+            self._last_observation_write_ns = 0
+            self._camera_stats = self._empty_camera_stats()
             self._active = True
             self._write_session_file(episode_dir, episode_name, started_ns)
             self._write_event_locked("recording_started", trigger)
@@ -512,6 +741,9 @@ class EpisodeRecorder(Node):
         with self._lock:
             if not self._active:
                 return False
+            finished_ns = self.get_clock().now().nanoseconds
+            duration_sec = max((finished_ns - self._episode_started_ns) / 1e9, 0.0)
+            camera_stats = copy.deepcopy(self._camera_stats)
             if event is not None:
                 self._write_event_locked(event, button)
             self._write_event_locked("recording_stopped", reason=reason)
@@ -525,6 +757,8 @@ class EpisodeRecorder(Node):
             self._episode_dir = None
             self._episode_name = ""
             self._episode_task = ""
+            self._episode_started_ns = 0
+            self._last_observation_write_ns = 0
             if event_file is not None:
                 event_file.flush()
                 event_file.close()
@@ -534,9 +768,36 @@ class EpisodeRecorder(Node):
         if episode_dir is None:
             return False
 
+        camera_summary = ", ".join(
+            f"{camera_name}:recv={stats['received']},enc={stats['encoded']},"
+            f"write={stats['written']},drop_q={stats['dropped_queue']},"
+            f"drop_stale={stats['dropped_stale']},"
+            f"errors={stats['encode_errors'] + stats['write_errors']}"
+            for camera_name, stats in camera_stats.items()
+        )
+        self.get_logger().info(
+            f"Episode RGB summary ({duration_sec:.3f}s): {camera_summary}")
+        zero_frame_cameras = [
+            camera_name
+            for camera_name, stats in camera_stats.items()
+            if stats["written"] == 0
+        ]
+        if save and zero_frame_cameras:
+            self.get_logger().error(
+                "Successful episode contains zero written RGB frames for: "
+                + ", ".join(zero_frame_cameras)
+                + "; saving is still allowed because camera frame-rate validation is disabled"
+            )
+
         if save:
             try:
-                self._update_session_result(episode_dir, "success", True)
+                self._update_session_result(
+                    episode_dir,
+                    "success",
+                    True,
+                    duration_sec=duration_sec,
+                    camera_stats=camera_stats,
+                )
                 final_dir = self.output_root / episode_name
                 if final_dir.exists():
                     raise RuntimeError(f"episode destination already exists: {final_dir}")
@@ -589,6 +850,19 @@ class EpisodeRecorder(Node):
         self.get_logger().info(f"Next episode language task updated: {task!r}")
 
     def _lowstate_callback(self, message):
+        receive_time_ns = self.get_clock().now().nanoseconds
+        with self._lock:
+            if not self._active:
+                return
+            if (
+                self._last_observation_write_ns > 0
+                and receive_time_ns - self._last_observation_write_ns
+                < self.observation_period_ns
+            ):
+                return
+            episode_generation = self._episode_generation
+            self._last_observation_write_ns = receive_time_ns
+
         positions = list(message.joint_states.position)
         velocities = list(message.joint_states.velocity)
         if len(positions) < 26:
@@ -598,11 +872,11 @@ class EpisodeRecorder(Node):
         derived = self._arm_joint_state(
             message.stamp, self.joint_names, arm_positions, arm_velocities)
         with self._lock:
-            if self._active:
+            if self._active and episode_generation == self._episode_generation:
                 self._write_bag_message_locked(
                     self.observation_joint_topic,
                     derived,
-                    self.get_clock().now().nanoseconds,
+                    receive_time_ns,
                 )
 
     def _command_callback(self, message):
@@ -670,28 +944,43 @@ class EpisodeRecorder(Node):
                         self.joy_topic, message, self.get_clock().now().nanoseconds)
 
     def _image_callback(self, camera_name, message):
+        receive_time_ns = self.get_clock().now().nanoseconds
         with self._lock:
+            self._camera_last_seen_ns[camera_name] = receive_time_ns
             if not self._active:
                 return
-            camera = self.cameras[camera_name]
-            try:
-                image = self._bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
-                success, encoded = cv2.imencode(
-                    ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
-                )
-                if not success:
-                    raise RuntimeError("cv2.imencode returned false")
-                compressed = CompressedImage()
-                compressed.header = message.header
-                compressed.format = "jpeg"
-                compressed.data = encoded.tobytes()
-                self._write_bag_message_locked(
-                    str(camera["recorded_topic"]),
-                    compressed,
-                    self.get_clock().now().nanoseconds,
-                )
-            except (CvBridgeError, RuntimeError, ValueError) as error:
-                self.get_logger().warning(f"Failed to encode {camera_name} RGB frame: {error}")
+            episode_generation = self._episode_generation
+            self._camera_stats[camera_name]["received"] += 1
+
+        item = (episode_generation, message, receive_time_ns)
+        image_queue = self._image_queues[camera_name]
+        try:
+            image_queue.put_nowait(item)
+            with self._lock:
+                if episode_generation == self._episode_generation:
+                    self._camera_stats[camera_name]["enqueued"] += 1
+            return
+        except Full:
+            pass
+
+        try:
+            image_queue.get_nowait()
+            image_queue.task_done()
+            with self._lock:
+                if episode_generation == self._episode_generation:
+                    self._camera_stats[camera_name]["dropped_queue"] += 1
+        except Empty:
+            pass
+
+        try:
+            image_queue.put_nowait(item)
+            with self._lock:
+                if episode_generation == self._episode_generation:
+                    self._camera_stats[camera_name]["enqueued"] += 1
+        except Full:
+            with self._lock:
+                if episode_generation == self._episode_generation:
+                    self._camera_stats[camera_name]["dropped_queue"] += 1
 
     def _topic_callback(self, topic, message):
         with self._lock:
@@ -713,16 +1002,23 @@ class EpisodeRecorder(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = None
+    executor = None
     try:
         node = EpisodeRecorder()
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor(num_threads=node.executor_threads)
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        if executor is not None:
+            executor.shutdown(timeout_sec=2.0)
         if node is not None:
             node.stop_for_shutdown()
+            node._stop_camera_workers()
             node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
