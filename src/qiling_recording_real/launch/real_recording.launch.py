@@ -23,9 +23,15 @@ def _launch_nodes(context):
         # rgb_camera.color_profile. Supplying both keeps one YAML format for
         # all three devices; unsupported inactive profiles are ignored by the
         # driver because depth is disabled.
-        width = int(camera.get("width", stream_config.get("width", 640)))
-        height = int(camera.get("height", stream_config.get("height", 480)))
-        fps = int(camera.get("fps", stream_config.get("fps", 30)))
+        # source_* is the profile requested from the physical device.  The
+        # recorder validates that it matches the stored width/height/fps rather
+        # than resizing or accepting a RealSense fallback profile.
+        width = int(camera.get(
+            "source_width", camera.get("width", stream_config.get("width", 640))))
+        height = int(camera.get(
+            "source_height", camera.get("height", stream_config.get("height", 480))))
+        fps = int(camera.get(
+            "source_fps", camera.get("fps", stream_config.get("fps", 30))))
         color_format = camera.get(
             "color_format", stream_config.get("color_format", "RGB8")
         )

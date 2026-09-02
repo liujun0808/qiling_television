@@ -6,13 +6,21 @@ output_root: /home/coral/liujun/qiling_television/recordings
 recording:
   storage_id: mcap
   jpeg_quality: 90
-  # Keep robot state close to the 50 Hz controller rate instead of writing
-  # the roughly 800 Hz low-level feedback stream into every episode.
-  observation_rate_hz: 50.0
+  # RGB is stored exactly as delivered by the cameras.  A profile mismatch is
+  # a recording error; no crop, resize or software rotation is applied.
+  image_resize_mode: none
+  # The 50 Hz sampler is a dedicated steady-clock thread.  It creates atomic
+  # observation/action/gripper batches for the high-priority writer queue.
+  state_action_rate_hz: 50.0
+  state_action_timeout_sec: 0.10
+  state_action_write_queue_depth: 2048
+  auxiliary_write_queue_depth: 2048
+  image_write_queue_depth: 1024
+  writer_drain_warning_sec: 5.0
   # An episode can start only when every RGB input has produced a recent frame.
   camera_timeout_sec: 0.5
-  # Each camera callback only enqueues the newest frames; JPEG work runs in a
-  # dedicated worker so camera traffic cannot block robot-state callbacks.
+  # Each camera callback only enqueues frames; JPEG work and MCAP writing run
+  # on dedicated workers and cannot block robot-state callbacks.
   image_queue_depth: 2
   executor_threads: 4
   camera_diagnostics_period_sec: 2.0
@@ -46,8 +54,11 @@ cameras:
     serial: "135122070003"
     camera_name: head_camera
     camera_namespace: camera_head
-    width: 1280
-    height: 720
+    source_width: 640
+    source_height: 480
+    source_fps: 30
+    width: 640
+    height: 480
     fps: 30
     color_format: RGB8
     image_topic: /camera_head/head_camera/color/image_raw
@@ -56,7 +67,10 @@ cameras:
     serial: "352122273604"
     camera_name: left_camera
     camera_namespace: camera_left
-    width: 848
+    source_width: 640
+    source_height: 480
+    source_fps: 30
+    width: 640
     height: 480
     fps: 30
     color_format: RGB8
@@ -66,7 +80,10 @@ cameras:
     serial: "409122273836"
     camera_name: right_camera
     camera_namespace: camera_right
-    width: 848
+    source_width: 640
+    source_height: 480
+    source_fps: 30
+    width: 640
     height: 480
     fps: 30
     color_format: RGB8
@@ -78,46 +95,39 @@ stream:
   # encoding format for compatibility with older session files.
   color_format: RGB8
 
+# Offline checker thresholds.  The checker reports every condition and exits
+# non-zero when any required condition fails; it never starts ROS nodes.
+quality_check:
+  image_min_rate_ratio: 0.95
+  image_max_gap_sec: 0.10
+  state_action_min_rate_ratio: 0.96
+  state_action_max_gap_sec: 0.05
+
 # These messages are recorded as their original ROS types in the same MCAP
 # file as the compressed RGB messages. /human_lower_state and
 # /human_lower_command are intentionally not included: the recorder derives
-# position/velocity-only arm messages from them so torque, kp, kd and eff are
-# not stored in the observation/action recording.
+# position/velocity-only right-arm messages from them so torque, kp, kd and
+# eff are not stored in the observation/action recording.
 topics:
-  - name: /teleop/left_wrist_state
-    type: geometry_msgs/msg/PoseStamped
   - name: /teleop/right_wrist_state
-    type: geometry_msgs/msg/PoseStamped
-  - name: /teleop/left_wrist_target
     type: geometry_msgs/msg/PoseStamped
   - name: /teleop/right_wrist_target
     type: geometry_msgs/msg/PoseStamped
-  - name: /teleop/left_control_mode
-    type: std_msgs/msg/UInt8
   - name: /teleop/right_control_mode
     type: std_msgs/msg/UInt8
   - name: /teleop/startup_home_complete
     type: std_msgs/msg/Bool
-  - name: /teleop/o6_trigger_state
-    type: std_msgs/msg/UInt8
-  - name: /xr/left_controller_pose
-    type: geometry_msgs/msg/PoseStamped
   - name: /xr/right_controller_pose
     type: geometry_msgs/msg/PoseStamped
 
 derived_topics:
   lowstate_topic: /human_lower_state
   command_topic: /human_lower_command
-  observation_joint_state_topic: /recording/observation/joint_state
-  action_joint_position_topic: /recording/action/joint_position
+  o6_trigger_state_topic: /teleop/o6_trigger_state
+  observation_joint_state_topic: /recording/observation/right_joint_state
+  action_joint_position_topic: /recording/action/right_joint_position
+  right_gripper_action_topic: /recording/action/right_gripper_closed
   joint_names:
-    - left_shoulder_pitch_joint
-    - left_shoulder_roll_joint
-    - left_shoulder_yaw_joint
-    - left_elbow_joint
-    - left_wrist_roll_joint
-    - left_wrist_pitch_joint
-    - left_wrist_yaw_joint
     - right_shoulder_pitch_joint
     - right_shoulder_roll_joint
     - right_shoulder_yaw_joint

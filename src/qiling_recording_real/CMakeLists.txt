@@ -15,6 +15,12 @@ install(PROGRAMS
   RENAME convert_to_lerobot
 )
 
+install(PROGRAMS
+  scripts/check_episode_quality.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME check_episode_quality
+)
+
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}
 )

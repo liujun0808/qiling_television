@@ -62,23 +62,38 @@ ros2 topic pub --once /recording/language std_msgs/msg/String \
 ```
 
 录制中的 episode 临时位于 `recordings/.pending/`；只有成功 episode 才会移动到正式目录。
-每个正式 episode 的 `rosbag/` 是 MCAP 文件，三路 RGB 以
-`sensor_msgs/msg/CompressedImage`（JPEG）保存；图像消息保留相机原始 header 时间戳，
-bag 写入时间为本机接收时间。`events.jsonl` 保存开始、成功、失败、停止等事件，
+每个正式 episode 的 `rosbag/` 是 MCAP 文件，三路 RGB 均以相机原生
+640×480@30Hz 的 `sensor_msgs/msg/CompressedImage`（JPEG）保存；不裁剪、不缩放、不做
+软件旋转，也不做软件限帧。图像消息保留原始帧的 header 时间戳，bag 写入时间为该原始帧
+的本机接收时间。开始录制前会核验三路实际输入都是 640×480，若驱动回退到其他 profile，
+则拒绝启动该条 episode。`events.jsonl` 保存开始、成功、失败、停止等事件，
 `session.yaml` 保存状态、分辨率、频率、按键、任务标签、话题配置以及每路相机的
 接收/压缩/写入/丢帧计数。失败/中断 episode 不会留下正式 episode 目录。
 
-三路相机使用独立的有界队列和 JPEG 工作线程；ROS 图像回调只负责更新输入新鲜度并
-把最新帧放入队列，避免压缩工作阻塞遥操和关节状态回调。按左 Y 前要求三路相机最近
-0.5 秒内均收到图像。录制期间每 2 秒会打印每路相机的 `recv/enc/write/drop/error`
-统计；当前只记录统计，不会因为实际图像频率低于某个阈值而拒绝保存成功 episode。
+三路相机使用独立的有界队列和 JPEG 工作线程；ROS 图像回调只更新新鲜度和入队，
+不压缩也不写 MCAP。采样线程使用单调时钟独立按 50Hz 排程，原子地生成右臂 observation、
+右臂关节 action、右手二值 gripper action 三条消息，再放入最高优先级队列。JPEG worker
+只负责编码和放入最低优先级图像队列；唯一的 MCAP writer 线程串行序列化/写入所有队列。
+因此相机编码、MCAP I/O 不会拖慢 50Hz 状态/动作采样。按左 Y 前要求三路相机最近0.5秒内
+均收到 640×480 图像。录制期间每2秒会打印每路相机的
+`recv/enc/write/drop_rate/drop_q/drop_writer/error` 统计。
+
+底层状态和命令回调只缓存最新数据。独立的 50 Hz 采样线程使用同一个采样时间戳，成组
+写入右臂 observation、右臂关节 action 和右手二值 gripper action，从而避免
+`/human_lower_state` 的高频输入直接决定数据频率。超过 0.1 秒没有更新的源数据不会
+被重复写入，并会在日志和 `session.yaml` 中累计为 skipped sample。
 
 录制的数据字段为：
 
 - RGB 图像；
-- 双臂实际关节位置、关节速度和实际末端位姿；
-- 双臂关节位置目标和末端位姿目标，可分别作为两种 action 来源；
-- Quest/遥操模式等用于回溯的事件与状态。
+- 右臂 7 维实际关节位置、7 维关节速度和实际末端位姿；
+- 右臂 7 维关节位置目标和末端位姿目标，可分别作为两种 action 来源；
+- 右手二值开合目标：`0=open`、`1=closed`，由 O6 状态位的 bit 1 派生；
+- 右手柄/遥操模式等用于回溯的事件与状态。
+
+左臂关节、左腕状态/目标和左控制器位姿不写入正式 episode。`/xr/controller_joy`
+仍会保留，因为 Y/X/A/B 录制按键位于该消息中。当前没有可靠的 O6 位置反馈，
+`right_gripper_closed` 是命令目标而不是实测手指位置。
 
 明确不录制关节力矩、`kp`、`kd`、`vel` 等 MIT 底层命令字段。录制器虽然读取
 `/human_lower_state` 和 `/human_lower_command`，但只从中派生位置/速度消息，原始
@@ -86,21 +101,9 @@ bag 写入时间为本机接收时间。`events.jsonl` 保存开始、成功、�
 
 ## 转换为 LeRobot
 
-录制完成后，修改 `config/lerobot_conversion.yaml` 的输出目录和 `action_mode`，然后：
-
-```bash
-ros2 run qiling_recording_real convert_to_lerobot \
-  --config-file /home/coral/liujun/qiling_television/src/qiling_recording_real/config/lerobot_conversion.yaml
-```
-
-`action_mode: joint`（默认）使用 14 维双臂关节位置目标作为主 action，
-`action_mode: eef` 使用 14 维双臂末端位姿目标；`include_alternate_actions: true`
-会把另一种 action 也保存在数据集字段中，便于后续选择。`action_mode: both` 会将
-末端位姿和关节位置拼接成一个 28 维主 action，通常只有在训练策略明确需要时才使用。
-
-转换器按相机接收时间戳做离线近似对齐，并通过 LeRobot Dataset v3 API 生成 Parquet
-和 MP4，不在实时录制过程中直接写 LeRobot 文件。需要在转换环境预先安装支持
-Dataset v3 的 LeRobot；转换器不会自动安装依赖。
+当前 episode 已切换为右臂单臂结构，并新增独立的右手二值 gripper action。仓库中的
+旧转换脚本仍按历史双臂字段设计，本次没有修改；正式转换应在主机 LeRobot 环境中按
+新的 7 维右臂 observation/action、7 维右腕位姿和 1 维 gripper action 重构。
 
 ## 注意事项
 
@@ -111,6 +114,19 @@ Dataset v3 的 LeRobot；转换器不会自动安装依赖。
 - 左手 D405：`352122273604`
 - 右手 D405：`409122273836`
 
-头部 D435i 配置为 RGB 1280×720@30 Hz，左右手 D405 配置为 RGB 848×480@30 Hz；
-三路均关闭深度、红外和 IMU。若某台设备实际不接受该 profile，RealSense 节点会在
-启动日志中报告 profile 错误，不会静默改用其他频率。
+当前流程请求三路 RealSense 原生 RGB 640×480@30Hz。深度、红外和IMU均关闭。
+`session.yaml` 中相机 `source_*` 和 `width/height/fps` 必须完全一致；它们分别记录
+驱动请求与落盘规范，不代表两次图像处理。
+
+## 离线质检
+
+每条成功 episode 录制完成后，建议在不启动任何 ROS 节点的情况下运行：
+
+```bash
+ros2 run qiling_recording_real check_episode_quality \
+  recordings/episode_YYYYMMDD_HHMMSS_mmm
+```
+
+它会逐项输出三路 JPEG 分辨率、实际 RGB 频率和最大帧间隔、右臂 observation/action/
+gripper 的原子 50Hz 批次、字段维度、队列/写入错误以及任务语言标签，并以 `OVERALL: PASS`
+或 `OVERALL: FAIL` 结束。检查只读取 MCAP，不会发布任何控制消息。
