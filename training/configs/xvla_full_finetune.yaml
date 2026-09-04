@@ -1,0 +1,60 @@
+# XVLA 全量微调唯一配置文件：参数均从此文件读取。
+environment:
+  # lerobot051 Conda 环境中的 Python。
+  python: /home/ub/miniconda3/envs/lerobot051/bin/python
+  # 使用的 GPU 编号。
+  cuda_visible_devices: "0"
+  # Hugging Face 模型与数据缓存目录。
+  hf_home: /home/ub/program/qiling_television/training/cache/huggingface
+dataset:
+  # 本地 LeRobot v3 数据集。
+  repo_id: local/qiling_right_arm_o6_v2
+  root: /home/ub/program/qiling_television/lerobot_dataset_v2
+  # 必须使用 pyav；当前 torchcodec 无法加载 FFmpeg。
+  video_backend: pyav
+  # 将本机器人相机名称映射为 XVLA 预训练权重固定使用的三个视觉输入名称。
+  rename_map:
+    observation.images.head: observation.images.image
+    observation.images.left: observation.images.image2
+    observation.images.right: observation.images.image3
+xvla:
+  # XVLA 预训练检查点；首次运行会下载或读取本地缓存。
+  pretrained_policy_path: lerobot/xvla-base
+  device: cuda
+  # 全量微调建议 bfloat16，降低显存占用。
+  dtype: bfloat16
+  # 自动适配 8 维动作：右臂 7 关节 + O6 开闭。
+  action_mode: auto
+  max_action_dim: 20
+  # 30Hz 下预测 32 帧约 1.07 秒；单次执行前 8 帧约 0.27 秒。
+  chunk_size: 32
+  n_action_steps: 8
+  # 头部、左腕、右腕三路图像。
+  num_image_views: 3
+  empty_cameras: 0
+  # 全量微调：所有主干组件都参与更新。
+  freeze_vision_encoder: false
+  freeze_language_encoder: false
+  train_policy_transformer: true
+  train_soft_prompts: true
+training:
+  # 产物目录；目录已存在时脚本拒绝覆盖。
+  output_dir: /home/ub/program/qiling_television/training/outputs/xvla_v2_full_ft
+  job_name: qiling_right_arm_o6_xvla_v2_full_ft
+  seed: 1000
+  # 显存不足时首先降低 batch_size。
+  batch_size: 4
+  num_workers: 4
+  steps: 200000
+  log_freq: 200
+  save_freq: 20000
+  eval_freq: 50000
+  save_checkpoint: true
+  learning_rate: 0.0001
+  warmup_steps: 1000
+  decay_steps: 20000
+  decay_learning_rate: 0.0000025
+logging:
+  # 第一轮不上传 W&B。
+  wandb_enabled: false
+  wandb_project: qiling_xvla

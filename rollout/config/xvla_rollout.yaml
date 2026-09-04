@@ -1,0 +1,20 @@
+# XVLA worker 配置。该进程仅在主机的 lerobot051 (Python 3.12) 环境运行，不导入 ROS2。
+environment:
+  python: /home/ub/miniconda3/envs/lerobot051/bin/python
+  cuda_visible_devices: "0"
+  hf_home: /home/ub/program/qiling_television/training/cache/huggingface
+
+model:
+  # 训练完成后修改为需要部署的 checkpoint/pretrained_model 目录。
+  checkpoint: /home/ub/program/qiling_television/training/outputs/xvla_v2_full_ft/checkpoints/020000/pretrained_model
+  # 当前训练集只有一个任务；文本必须与录制/训练时的 task 保持一致。
+  task: "Pick up the beverage bottle from the table and place it into the bowl"
+  # 每次模型推理只交给 ROS bridge 前 8 个动作；它们以 30Hz 的数据集时间尺度执行。
+  action_steps_to_send: 8
+
+ipc:
+  host: 127.0.0.1
+  port: 29551
+  authkey: qiling_xvla_rollout_v1
+  retry_delay_sec: 1.0
+  not_ready_delay_sec: 0.02

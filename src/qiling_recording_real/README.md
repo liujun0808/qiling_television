@@ -34,6 +34,32 @@ ros2 launch qiling_kinematics_real xr_teleop_real.launch.py
 ros2 launch qiling_recording_real real_recording.launch.py
 ```
 
+## 只启动三路相机（rollout / 画面检查）
+
+以下 launch 只启动头部 D435i、左腕 D405、右腕 D405，不启动 episode recorder，也不发布任何
+机器人命令。它从 `config/real_recording.yaml` 读取已确认的序列号与映射，并强制检查三路均为
+原生 RGB `640×480@30Hz`：
+
+```bash
+ros2 launch qiling_recording_real tri_camera.launch.py
+```
+
+也可直接运行包装脚本：
+
+```bash
+bash src/qiling_recording_real/scripts/start_tri_cameras.sh
+```
+
+三个输出话题为：
+
+```text
+/camera_head/head_camera/color/image_raw
+/camera_left/left_camera/color/image_raw
+/camera_right/right_camera/color/image_raw
+```
+
+`real_recording.launch.py` 已经会启动同样的三路相机，因此录制时二者只能选择一个，不能同时启动。
+
 录制器启动后处于 idle 状态。按左 Y 开始一个 episode；成功或失败标记只关闭当前
 episode。成功/失败后按右 B 回 home，回到 READY 后按左 Y 开始下一条。
 
@@ -101,9 +127,20 @@ ros2 topic pub --once /recording/language std_msgs/msg/String \
 
 ## 转换为 LeRobot
 
-当前 episode 已切换为右臂单臂结构，并新增独立的右手二值 gripper action。仓库中的
-旧转换脚本仍按历史双臂字段设计，本次没有修改；正式转换应在主机 LeRobot 环境中按
-新的 7 维右臂 observation/action、7 维右腕位姿和 1 维 gripper action 重构。
+当前转换链路只保留两阶段实现：
+
+```text
+成功 episode MCAP
+  ↓ build_training_admission_manifest.py（生成可用连续片段清单）
+  ↓ export_manifest_to_intermediate.py（ROS Python 3.10）
+intermediate：JPEG + q/dq/q_target/O6 标签
+  ↓ pack_intermediate_to_lerobot.py（lerobot051 Python 3.12）
+LeRobot v3 数据集
+```
+
+`export_manifest_to_intermediate.py` 是唯一读取 MCAP/ROS bag 的转换阶段；
+`pack_intermediate_to_lerobot.py` 是唯一依赖 LeRobot 的打包阶段。旧的历史双臂直转脚本与已废弃的
+人工 review/promotion 脚本已删除，避免被误用于当前右臂 + O6 数据结构。
 
 ## 注意事项
 

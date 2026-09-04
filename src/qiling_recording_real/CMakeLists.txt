@@ -10,15 +10,26 @@ install(PROGRAMS
 )
 
 install(PROGRAMS
-  scripts/convert_to_lerobot.py
-  DESTINATION lib/${PROJECT_NAME}
-  RENAME convert_to_lerobot
-)
-
-install(PROGRAMS
   scripts/check_episode_quality.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME check_episode_quality
+)
+
+install(PROGRAMS
+  scripts/build_training_admission_manifest.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME build_training_admission_manifest
+)
+
+install(PROGRAMS
+  scripts/export_manifest_to_intermediate.py
+  scripts/pack_intermediate_to_lerobot.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  scripts/start_tri_cameras.sh
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 install(DIRECTORY config launch

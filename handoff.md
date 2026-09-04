@@ -518,7 +518,7 @@ ros2 topic hz /human_lower_command
 `/human_lower_state`、`/human_lower_command` 提取关节位置/速度和位置目标，不保存
 原始 MIT 消息中的力矩、`kp`、`kd`、`vel` 等底层字段，派生 `JointState.effort` 为空。
 每个成功 episode 独立保存为一个 MCAP 目录；录制中的 episode 位于 `.pending`，失败或
-中断时删除，不进入转换输入。已提供 `convert_to_lerobot.py`，可离线生成 LeRobot Dataset v3；默认主 action 为
+中断时删除，不进入转换输入。旧的 `convert_to_lerobot.py` 已删除；当前采用“准入清单 → ROS 导出中间数据 → LeRobot 打包”的两阶段转换链路，默认主 action 为
 14 维双臂关节位置目标，同时保留末端位姿 action 供后续选择。
 
 ## 9. 按键约定
