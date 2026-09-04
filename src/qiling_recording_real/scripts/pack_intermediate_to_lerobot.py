@@ -13,12 +13,12 @@ def load_rgb(p):
     if x is None: raise RuntimeError(f"cannot decode {p}")
     return cv2.cvtColor(x,cv2.COLOR_BGR2RGB)
 def main():
-    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument("intermediate_root"); ap.add_argument("--output-root",required=True); ap.add_argument("--repo-id",default="local/qiling_right_arm_o6"); a=ap.parse_args()
+    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument("intermediate_root"); ap.add_argument("--output-root",required=True); ap.add_argument("--repo-id",default="local/qiling_right_arm_o6"); ap.add_argument("--fps",type=float,default=30.0); a=ap.parse_args()
     inp=Path(a.intermediate_root); out=Path(a.output_root)
     if out.exists(): raise RuntimeError(f"output exists: {out}")
     entries=json.loads((inp/"index.json").read_text(encoding="utf-8"))["episodes"]
     features={"observation.images.head":image(),"observation.images.left":image(),"observation.images.right":image(),"observation.state":vec(7,JOINTS),"observation.velocity":vec(7,["d_"+x for x in JOINTS]),"action":vec(8,JOINTS+["right_o6_closed"])}
-    ds=LeRobotDataset.create(repo_id=a.repo_id,fps=30,features=features,root=out,robot_type="qiling_right_arm_o6",use_videos=True,image_writer_processes=0,image_writer_threads=4)
+    ds=LeRobotDataset.create(repo_id=a.repo_id,fps=a.fps,features=features,root=out,robot_type="qiling_right_arm_o6",use_videos=True,image_writer_processes=0,image_writer_threads=4)
     try:
         for entry in entries:
             folder=inp/entry["folder"]; data=np.load(folder/"data.npz"); count=len(data["q"])

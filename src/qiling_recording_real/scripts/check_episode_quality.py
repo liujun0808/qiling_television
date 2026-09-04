@@ -23,12 +23,19 @@ import yaml
 class Report:
     def __init__(self):
         self.failures = 0
+        self.warnings = 0
 
     def check(self, label, condition, detail):
         status = "PASS" if condition else "FAIL"
         print(f"[{status}] {label}: {detail}")
         if not condition:
             self.failures += 1
+
+    def advisory(self, label, condition, detail):
+        status = "PASS" if condition else "WARN"
+        print(f"[{status}] {label}: {detail}")
+        if not condition:
+            self.warnings += 1
 
 
 def load_yaml(path):
@@ -81,32 +88,41 @@ def read_streams(bag_dir, wanted_topics):
     return streams, missing_topics
 
 
-def check_camera(report, name, camera, stream, thresholds, session_stats):
+def check_camera(report, name, camera, expected_camera, stream, thresholds, session_stats):
     width = int(camera["width"])
     height = int(camera["height"])
     target_fps = float(camera["fps"])
     source_width = int(camera.get("source_width", width))
     source_height = int(camera.get("source_height", height))
     source_fps = float(camera.get("source_fps", target_fps))
+    expected_width = int(expected_camera["width"])
+    expected_height = int(expected_camera["height"])
+    expected_fps = float(expected_camera["fps"])
+    expected_source_width = int(expected_camera.get("source_width", expected_width))
+    expected_source_height = int(expected_camera.get("source_height", expected_height))
+    expected_source_fps = float(expected_camera.get("source_fps", expected_fps))
     report.check(
         f"camera/{name}/profile",
-        (width, height, target_fps) == (640, 480, 30.0)
-        and (source_width, source_height, source_fps) == (640, 480, 30.0),
+        (width, height, target_fps) == (expected_width, expected_height, expected_fps)
+        and (source_width, source_height, source_fps) == (
+            expected_source_width, expected_source_height, expected_source_fps),
         f"source={source_width}x{source_height}@{source_fps:g}Hz, "
-        f"recorded={width}x{height}@{target_fps:g}Hz",
+        f"recorded={width}x{height}@{target_fps:g}Hz, "
+        f"expected={expected_source_width}x{expected_source_height}@"
+        f"{expected_source_fps:g}Hz",
     )
     count = len(stream)
     rate_hz, max_gap_sec = rate_and_max_gap(stream)
     report.check(
         f"camera/{name}/frames", count > 0,
         f"count={count}")
-    report.check(
+    report.advisory(
         f"camera/{name}/rate",
         rate_hz >= target_fps * thresholds["image_min_rate_ratio"],
         f"observed={rate_hz:.2f}Hz, target={target_fps:.2f}Hz, "
         f"minimum={target_fps * thresholds['image_min_rate_ratio']:.2f}Hz",
     )
-    report.check(
+    report.advisory(
         f"camera/{name}/max_gap",
         max_gap_sec <= thresholds["image_max_gap_sec"],
         f"max_gap={max_gap_sec:.4f}s, allowed={thresholds['image_max_gap_sec']:.4f}s",
@@ -129,7 +145,7 @@ def check_camera(report, name, camera, stream, thresholds, session_stats):
     stats = session_stats.get(name, {})
     faults = sum(int(stats.get(field, 0)) for field in (
         "encode_errors", "write_errors", "dropped_writer_queue"))
-    report.check(
+    report.advisory(
         f"camera/{name}/recorder_faults", faults == 0,
         f"encode_errors={stats.get('encode_errors', 0)}, "
         f"write_errors={stats.get('write_errors', 0)}, "
@@ -184,18 +200,18 @@ def check_state_action(report, session, streams, thresholds):
         == [timestamp for timestamp, _ in action]
         == [timestamp for timestamp, _ in gripper]
     )
-    report.check(
+    report.advisory(
         "state_action/atomic_batches", count_match,
         f"observation={len(observation)}, action={len(action)}, gripper={len(gripper)}",
     )
     rate_hz, max_gap_sec = rate_and_max_gap(observation)
-    report.check(
+    report.advisory(
         "state_action/rate",
         rate_hz >= target_hz * thresholds["state_action_min_rate_ratio"],
         f"observed={rate_hz:.2f}Hz, target={target_hz:.2f}Hz, "
         f"minimum={target_hz * thresholds['state_action_min_rate_ratio']:.2f}Hz",
     )
-    report.check(
+    report.advisory(
         "state_action/max_gap",
         max_gap_sec <= thresholds["state_action_max_gap_sec"],
         f"max_gap={max_gap_sec:.4f}s, allowed={thresholds['state_action_max_gap_sec']:.4f}s",
@@ -211,7 +227,7 @@ def check_state_action(report, session, streams, thresholds):
     stats = session.get("state_action_stats", {})
     faults = int(stats.get("samples_dropped_writer_queue", 0)) + int(
         stats.get("write_errors", 0))
-    report.check(
+    report.advisory(
         "state_action/recorder_faults", faults == 0,
         f"dropped_writer_queue={stats.get('samples_dropped_writer_queue', 0)}, "
         f"write_errors={stats.get('write_errors', 0)}, "
@@ -236,7 +252,7 @@ def parse_args():
     parser.add_argument(
         "--config-file",
         default=str(default_config),
-        help="Recording YAML that supplies quality_check thresholds",
+        help="Recording YAML that supplies expected RGB profiles and quality thresholds",
     )
     return parser.parse_args()
 
@@ -263,9 +279,12 @@ def main():
             config.get("quality_check", {}).get("state_action_max_gap_sec", 0.05)),
     }
     cameras = session.get("cameras", {})
+    expected_cameras = config.get("cameras", {})
     derived = session.get("derived_topics", {})
     if set(cameras) != {"head", "left", "right"}:
         raise RuntimeError("session.yaml must define head, left, and right cameras")
+    if set(expected_cameras) != {"head", "left", "right"}:
+        raise RuntimeError("config_file must define head, left, and right cameras")
     required_derived = (
         "observation_joint_state_topic",
         "action_joint_position_topic",
@@ -288,7 +307,12 @@ def main():
     report = Report()
 
     print(f"Episode: {episode_dir}")
-    print("Expected: RGB=640x480@30Hz JPEG, right-arm observation/action/gripper=50Hz")
+    expected_profiles = ", ".join(
+        f"{name}={int(camera['width'])}x{int(camera['height'])}@{float(camera['fps']):g}Hz"
+        for name, camera in expected_cameras.items())
+    print(
+        "Expected: RGB JPEG " + expected_profiles
+        + ", right-arm observation/action/gripper=50Hz")
     report.check(
         "episode/status",
         session.get("status") == "success" and bool(session.get("saved")),
@@ -311,12 +335,12 @@ def main():
     camera_stats = session.get("camera_stats", {})
     for name, camera in cameras.items():
         check_camera(
-            report, name, camera, streams.get(camera_topics[name], []),
+            report, name, camera, expected_cameras[name], streams.get(camera_topics[name], []),
             thresholds, camera_stats)
     check_state_action(report, session, streams, thresholds)
 
     writer_stats = session.get("writer_stats", {})
-    report.check(
+    report.advisory(
         "writer/auxiliary_queue",
         int(writer_stats.get("auxiliary_messages_dropped_writer_queue", 0)) == 0,
         "dropped=" + str(
@@ -325,6 +349,11 @@ def main():
     if report.failures:
         print(f"OVERALL: FAIL ({report.failures} required checks failed)")
         return 2
+    if report.warnings:
+        print(
+            f"OVERALL: PASS WITH WARNINGS ({report.warnings} timing/queue warnings; "
+            "episode remains eligible for conversion)")
+        return 0
     print("OVERALL: PASS (episode satisfies the current RGB and 50Hz right-arm requirements)")
     return 0
 

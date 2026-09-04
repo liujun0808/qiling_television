@@ -3,7 +3,7 @@ from pathlib import Path
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -17,6 +17,7 @@ def _launch_nodes(context):
     stream_config = config.get("stream", {})
     cameras = config["cameras"]
     nodes = []
+    requested_profiles = []
 
     for camera in cameras.values():
         # D405 uses depth_module.color_profile while D435i uses
@@ -36,6 +37,8 @@ def _launch_nodes(context):
             "color_format", stream_config.get("color_format", "RGB8")
         )
         color_profile = f"{width}x{height}x{fps}"
+        requested_profiles.append(
+            f"{camera['camera_name']}({camera['serial']})={width}x{height}@{fps}Hz")
         parameters = {
             # RealSense ROS uses these parameters when constructing the
             # camera topic namespace.  The ROS Node name/namespace below do
@@ -71,6 +74,14 @@ def _launch_nodes(context):
             )
         )
 
+    nodes.insert(
+        0,
+        LogInfo(
+            msg="Recording camera profile requests: "
+            + ", ".join(requested_profiles)
+            + "; native RGB only (no resize)",
+        ),
+    )
     nodes.append(
         Node(
             package="qiling_recording_real",

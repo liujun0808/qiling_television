@@ -353,7 +353,7 @@ class EpisodeRecorder(Node):
             f"{name}="
             f"{int(camera.get('source_width', camera.get('width', 640)))}x"
             f"{int(camera.get('source_height', camera.get('height', 480)))}@"
-            f"{int(camera.get('source_fps', camera.get('fps', 20)))}Hz->"
+            f"{int(camera.get('source_fps', camera.get('fps', 30)))}Hz->"
             f"{self._camera_output_profiles[name]['width']}x"
             f"{self._camera_output_profiles[name]['height']}@"
             f"{self._camera_output_profiles[name]['fps']}Hz"
@@ -1039,7 +1039,7 @@ class EpisodeRecorder(Node):
             if profile_mismatches:
                 self.get_logger().error(
                     "Recording start rejected because RGB profiles do not match the "
-                    "native 640x480 recording configuration: "
+                    "configured native recording profile: "
                     + "; ".join(profile_mismatches)
                 )
                 return False

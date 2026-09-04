@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 import yaml
@@ -23,15 +23,24 @@ def _camera_nodes(context):
         raise RuntimeError("real_recording.yaml must define exactly head, left and right cameras")
 
     nodes = []
+    requested_profiles = []
     for camera_key in ("head", "left", "right"):
         camera = cameras[camera_key]
         width = int(camera.get("source_width", camera.get("width", 640)))
         height = int(camera.get("source_height", camera.get("height", 480)))
         fps = int(camera.get("source_fps", camera.get("fps", 30)))
-        if (width, height, fps) != (640, 480, 30):
+        output_profile = (
+            int(camera.get("width", width)),
+            int(camera.get("height", height)),
+            int(camera.get("fps", fps)),
+        )
+        if (width, height, fps) != output_profile:
             raise RuntimeError(
-                f"{camera_key} camera must be configured as 640x480@30, got {width}x{height}@{fps}")
+                f"{camera_key} camera source profile {width}x{height}@{fps}Hz does not "
+                f"match recording profile {output_profile[0]}x{output_profile[1]}@{output_profile[2]}Hz")
         profile = f"{width}x{height}x{fps}"
+        requested_profiles.append(
+            f"{camera['camera_name']}({camera['serial']})={width}x{height}@{fps}Hz")
         nodes.append(Node(
             package="realsense2_camera",
             executable="realsense2_camera_node",
@@ -62,7 +71,13 @@ def _camera_nodes(context):
                 "publish_tf": False,
             }],
         ))
-    return nodes
+    return [
+        LogInfo(
+            msg="Tri-camera profile requests: " + ", ".join(requested_profiles)
+            + "; native RGB only (no resize)",
+        ),
+        *nodes,
+    ]
 
 
 def generate_launch_description():
@@ -75,7 +90,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "config_file",
             default_value=str(default_config),
-            description="Camera serial/profile configuration; must declare 640x480@30.",
+            description="Camera serial/profile configuration; source and recording profiles must match.",
         ),
         OpaqueFunction(function=_camera_nodes),
     ])

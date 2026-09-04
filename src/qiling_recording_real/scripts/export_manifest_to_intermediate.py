@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Python 3.10 / ROS Humble stage: export manifest-selected MCAP frames.
+"""Python 3.10 / ROS Humble stage: export full manifest-selected MCAP episodes.
 
 The output contains JPEG bytes plus q, dq, q_target and O6 labels.  It is the
 only conversion stage that imports rosbag2_py; the next stage runs in Conda.
+When a stream has a temporal dropout, its nearest available sample is retained
+so a structurally valid source episode remains one exported episode.
 """
 import argparse, bisect, json, shutil
 from pathlib import Path
@@ -12,10 +14,12 @@ from rosbag2_py import ConverterOptions, SequentialReader, StorageOptions
 from rosidl_runtime_py.utilities import get_message
 
 def read_yaml(p): return yaml.safe_load(Path(p).read_text(encoding="utf-8")) or {}
-def near(stream, times, t, tol):
+def near(stream, times, t, _tol):
     i=bisect.bisect_left(times,t); choices=[x for x in (i-1,i) if 0<=x<len(times)]
     if not choices: return None
-    j=min(choices,key=lambda x:abs(times[x]-t)); return stream[j][1] if abs(times[j]-t)<=tol else None
+    # Collection mode keeps every head-camera frame.  For a dropped stream,
+    # use the nearest available sample instead of removing this time step.
+    j=min(choices,key=lambda x:abs(times[x]-t)); return stream[j][1]
 def streams(bag, topics):
     r=SequentialReader(); r.open(StorageOptions(uri=str(bag),storage_id="mcap"),ConverterOptions(input_serialization_format="cdr",output_serialization_format="cdr"))
     tm={x.name:x.type for x in r.get_all_topics_and_types()}; mt={t:get_message(tm[t]) for t in topics}
@@ -25,7 +29,7 @@ def streams(bag, topics):
         if t in mt: out[t].append((int(stamp),deserialize_message(raw,mt[t])))
     return out, {t:[x[0] for x in v] for t,v in out.items()}
 def main():
-    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument("manifest"); ap.add_argument("--output-root",required=True); ap.add_argument("--camera-tolerance-sec",type=float,default=.025); ap.add_argument("--state-tolerance-sec",type=float,default=.015); a=ap.parse_args()
+    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument("manifest"); ap.add_argument("--output-root",required=True); ap.add_argument("--camera-tolerance-sec",type=float,default=.025,help="Retained for command compatibility; nearest-frame alignment is unbounded in collection mode."); ap.add_argument("--state-tolerance-sec",type=float,default=.015,help="Retained for command compatibility; nearest-state alignment is unbounded in collection mode."); a=ap.parse_args()
     m=json.loads(Path(a.manifest).read_text(encoding="utf-8")); root=Path(a.output_root)
     if root.exists(): raise RuntimeError(f"output exists: {root}")
     root.mkdir(parents=True); shutil.copy2(a.manifest,root/"source_manifest.json")

@@ -4,9 +4,11 @@
 
 The manifest never rewrites recordings.  It distinguishes the legacy dual-arm
 schema from the current right-arm schema, evaluates the current quality gates,
-and splits image-dropout episodes into timestamp-continuous 30 Hz candidate
-segments.  A later LeRobot converter should consume ``training_segments`` from
-this manifest instead of globbing every ``episode_*`` directory.
+and emits one full candidate segment for every structurally valid successful
+episode. Timing dropout is retained as a warning rather than used to split or
+exclude an episode. A later LeRobot converter should consume
+``training_segments`` from this manifest instead of globbing every
+``episode_*`` directory.
 """
 
 import argparse
@@ -232,7 +234,7 @@ def synchronized_segments(streams, topics, camera_tolerance_ns,
     samples = []
     previous_time_ns = None
     # The head camera is the policy/video master.  Do not force a synthetic
-    # 30 Hz grid here: otherwise normal camera phase offsets and timestamp
+    # fixed-rate grid here: otherwise normal camera phase offsets and timestamp
     # jitter create artificial gaps.  A real excessive head-frame gap still
     # terminates the segment below.
     for current_ns, _ in streams[topics["head"]]:
@@ -264,7 +266,7 @@ def synchronized_segments(streams, topics, camera_tolerance_ns,
     }
 
 
-def evaluate_episode(episode_dir, thresholds, args, reacquire_ids):
+def evaluate_episode(episode_dir, thresholds, expected_cameras, args, reacquire_ids):
     session = load_yaml(episode_dir / "session.yaml")
     events = load_events(episode_dir / "events.jsonl")
     result = {
@@ -276,6 +278,7 @@ def evaluate_episode(episode_dir, thresholds, args, reacquire_ids):
         "saved": bool(session.get("saved")),
         "segments": [],
         "reasons": [],
+        "warnings": [],
     }
     cameras = session.get("cameras", {})
     derived = session.get("derived_topics", {})
@@ -306,6 +309,9 @@ def evaluate_episode(episode_dir, thresholds, args, reacquire_ids):
     }
     if missing_topics:
         result["reasons"].append("missing_topics:" + ",".join(missing_topics))
+    for name, topic in topics.items():
+        if not streams.get(topic):
+            result["reasons"].append(f"empty_topic:{name}")
     if session.get("status") != "success" or not session.get("saved"):
         result["reasons"].append("session_not_saved_success")
     if result["event_status"] != "success":
@@ -316,13 +322,14 @@ def evaluate_episode(episode_dir, thresholds, args, reacquire_ids):
     camera_invalid = {}
     for name in ("head", "left", "right"):
         camera = cameras[name]
+        expected = expected_cameras[name]
         profile_ok = (
-            int(camera.get("source_width", 0)) == 640
-            and int(camera.get("source_height", 0)) == 480
-            and float(camera.get("source_fps", 0.0)) == 30.0
-            and int(camera.get("width", 0)) == 640
-            and int(camera.get("height", 0)) == 480
-            and float(camera.get("fps", 0.0)) == 30.0
+            int(camera.get("source_width", 0)) == int(expected.get("source_width", expected["width"]))
+            and int(camera.get("source_height", 0)) == int(expected.get("source_height", expected["height"]))
+            and float(camera.get("source_fps", 0.0)) == float(expected.get("source_fps", expected["fps"]))
+            and int(camera.get("width", 0)) == int(expected["width"])
+            and int(camera.get("height", 0)) == int(expected["height"])
+            and float(camera.get("fps", 0.0)) == float(expected["fps"])
         )
         if not profile_ok:
             result["reasons"].append(f"camera_profile:{name}")
@@ -340,12 +347,12 @@ def evaluate_episode(episode_dir, thresholds, args, reacquire_ids):
     )
     result["state_action_validation"] = validation
     if not validation["atomic"]:
-        result["reasons"].append("state_action_not_atomic")
+        result["warnings"].append("state_action_not_atomic")
     if any(validation[key] for key in (
             "invalid_observation", "invalid_action", "invalid_gripper")):
         result["reasons"].append("state_action_schema")
     if not camera_stats_clean(session):
-        result["reasons"].append("recorder_faults")
+        result["warnings"].append("recorder_faults")
 
     state_metrics = result["stream_metrics"]["observation"]
     state_strict = (
@@ -353,50 +360,43 @@ def evaluate_episode(episode_dir, thresholds, args, reacquire_ids):
         and state_metrics["max_gap_sec"] <= thresholds["state_action_max_gap_sec"]
     )
     if not state_strict:
-        result["reasons"].append("state_action_rate_or_gap")
+        result["warnings"].append("state_action_rate_or_gap")
     camera_strict = True
     for name in ("head", "left", "right"):
         metrics = result["stream_metrics"][name]
         if not (
-            metrics["rate_hz"] >= 30.0 * thresholds["image_min_rate_ratio"]
+            metrics["rate_hz"] >= float(expected_cameras[name]["fps"])
+            * thresholds["image_min_rate_ratio"]
             and metrics["max_gap_sec"] <= thresholds["image_max_gap_sec"]
         ):
             camera_strict = False
 
-    segments, sync_stats = synchronized_segments(
-        streams,
-        topics,
-        int(args.camera_sync_tolerance_sec * 1e9),
-        int(args.state_action_sync_tolerance_sec * 1e9),
-        int(thresholds["image_max_gap_sec"] * 1e9),
-        args.minimum_segment_sec,
-    )
-    result["synchronization"] = sync_stats
-    result["segments"] = segments
-    fundamental_ok = not result["reasons"] or set(result["reasons"]) <= {
-        "state_action_rate_or_gap"
+    if not camera_strict:
+        result["warnings"].append("camera_rate_or_gap")
+
+    if result["reasons"]:
+        result["tier"] = "rejected"
+        return result
+
+    # Keep each successful, structurally valid source episode intact.  The
+    # export stage aligns missing streams by nearest timestamp instead of
+    # dropping intervals because temporal dropout is advisory in this mode.
+    head_stream = streams[topics["head"]]
+    start_time_ns = head_stream[0][0]
+    end_time_ns = head_stream[-1][0]
+    result["segments"] = [{
+        "start_time_ns": start_time_ns,
+        "end_time_ns": end_time_ns,
+        "frames": len(head_stream),
+        "duration_sec": max(0.0, (end_time_ns - start_time_ns) / 1e9),
+    }]
+    result["synchronization"] = {
+        "policy": "all_recorded_frames_nearest_timestamp_alignment",
+        "candidate_frames": len(head_stream),
+        "valid_frames": len(head_stream),
+        "invalid_frames": 0,
     }
-    # A state/action continuity failure is never recovered by segmenting images.
-    if not state_strict:
-        result["tier"] = "rejected"
-        return result
-    if not fundamental_ok:
-        result["tier"] = "rejected"
-        return result
-    if result["source_episode"] in reacquire_ids:
-        # The guide is deliberately more conservative than an automatic
-        # segment finder.  Keep any recovered ranges for inspection, but do
-        # not admit them to the first XVLA training pass.
-        result["tier"] = "reacquire_recommended"
-        result["reasons"].append("listed_in_quality_guide_for_reacquisition")
-        return result
-    if camera_strict:
-        result["tier"] = "strict"
-    elif segments:
-        result["tier"] = "conditional_segmented"
-    else:
-        result["tier"] = "rejected"
-        result["reasons"].append("no_continuous_synchronized_segment")
+    result["tier"] = "all_recorded"
     return result
 
 
@@ -414,17 +414,16 @@ def write_markdown(path, manifest):
         "| Tier | Episodes | Training segments |",
         "|---|---:|---:|",
     ]
-    for tier in ("strict", "conditional_segmented", "reacquire_recommended",
-                 "rejected", "excluded_legacy_schema"):
+    for tier in ("all_recorded", "rejected", "excluded_legacy_schema"):
         lines.append(
             f"| {tier} | {summary['episodes_by_tier'].get(tier, 0)} | "
             f"{summary['segments_by_tier'].get(tier, 0)} |"
         )
     lines.extend([
         "",
-        "Only `training_segments` should be supplied to the first LeRobot/XVLA "
-        "conversion. `review_segments` require visual task-success review before "
-        "they can be promoted. `reacquire_segments` remain excluded.",
+        "All structurally valid successful episodes are listed in "
+        "`training_segments`. Timing/queue dropout is reported as a warning and "
+        "does not block conversion in this collection mode.",
         "",
         "## Training segments",
         "",
@@ -458,7 +457,9 @@ def parse_args():
     parser.add_argument(
         "--quality-guide", default=None,
         help="Optional RECORDING_QUALITY_GUIDE.txt; its serious-dropout list is excluded.")
-    parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument(
+        "--fps", type=float, default=None,
+        help="Output policy rate (default: head camera fps in config_file)")
     parser.add_argument("--camera-sync-tolerance-sec", type=float, default=0.025)
     parser.add_argument("--state-action-sync-tolerance-sec", type=float, default=0.015)
     parser.add_argument("--minimum-segment-sec", type=float, default=3.0)
@@ -470,8 +471,10 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.fps <= 0.0 or args.minimum_segment_sec <= 0.0:
-        raise RuntimeError("fps and minimum-segment-sec must be positive")
+    if args.fps is not None and args.fps <= 0.0:
+        raise RuntimeError("fps must be positive")
+    if args.minimum_segment_sec <= 0.0:
+        raise RuntimeError("minimum-segment-sec must be positive")
     input_root = Path(args.input_root).expanduser().resolve()
     if not input_root.is_dir():
         raise RuntimeError(f"Input root does not exist: {input_root}")
@@ -481,6 +484,11 @@ def main():
         input_root.parent / "RECORDING_QUALITY_GUIDE.txt")
     reacquire_ids = load_reacquire_ids(quality_guide)
     config = load_yaml(args.config_file)
+    expected_cameras = config.get("cameras", {})
+    if set(expected_cameras) != {"head", "left", "right"}:
+        raise RuntimeError("config_file must define head, left, and right cameras")
+    if args.fps is None:
+        args.fps = float(expected_cameras["head"]["fps"])
     quality = config.get("quality_check", {})
     thresholds = {
         "image_min_rate_ratio": float(quality.get("image_min_rate_ratio", 0.95)),
@@ -497,7 +505,8 @@ def main():
         if not ((episode_dir / "session.yaml").is_file() and (episode_dir / "rosbag").is_dir()):
             continue
         print(f"Inspecting {episode_dir.name}", flush=True)
-        result = evaluate_episode(episode_dir, thresholds, args, reacquire_ids)
+        result = evaluate_episode(
+            episode_dir, thresholds, expected_cameras, args, reacquire_ids)
         for index, segment in enumerate(result["segments"]):
             segment_id = f"{result['source_episode']}__seg_{index:03d}"
             segment.update({
@@ -509,12 +518,8 @@ def main():
                 "schema": CURRENT_SCHEMA,
                 "fps": args.fps,
             })
-            if result["tier"] == "strict":
+            if result["tier"] == "all_recorded":
                 training_segments.append(segment)
-            elif result["tier"] == "conditional_segmented":
-                review_segments.append(segment)
-            elif result["tier"] == "reacquire_recommended":
-                reacquire_segments.append(segment)
         episodes.append(result)
 
     now = __import__("datetime").datetime.now(

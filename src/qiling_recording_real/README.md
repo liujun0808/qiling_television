@@ -165,5 +165,6 @@ ros2 run qiling_recording_real check_episode_quality \
 ```
 
 它会逐项输出三路 JPEG 分辨率、实际 RGB 频率和最大帧间隔、右臂 observation/action/
-gripper 的原子 50Hz 批次、字段维度、队列/写入错误以及任务语言标签，并以 `OVERALL: PASS`
-或 `OVERALL: FAIL` 结束。检查只读取 MCAP，不会发布任何控制消息。
+gripper 的原子 50Hz 批次、字段维度、队列/写入错误以及任务语言标签。帧率、帧间隔、
+原子批次和写队列异常仅输出 `WARN`，不会阻断转换；缺 topic、空数据、JPEG 损坏或字段
+格式错误仍会以 `OVERALL: FAIL` 标记。检查只读取 MCAP，不会发布任何控制消息。
