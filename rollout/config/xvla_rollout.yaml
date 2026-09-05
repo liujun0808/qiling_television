@@ -6,11 +6,11 @@ environment:
 
 model:
   # 训练完成后修改为需要部署的 checkpoint/pretrained_model 目录。
-  checkpoint: /home/ub/program/qiling_television/training/outputs/xvla_v2_full_ft/checkpoints/020000/pretrained_model
+  checkpoint: /home/ub/program/qiling_television/training/outputs/xvla_v2_full_ft/checkpoints/180000/pretrained_model
   # 当前训练集只有一个任务；文本必须与录制/训练时的 task 保持一致。
   task: "Pick up the beverage bottle from the table and place it into the bowl"
   # 每次模型推理只交给 ROS bridge 前 8 个动作；它们以 30Hz 的数据集时间尺度执行。
-  action_steps_to_send: 8
+  action_steps_to_send: 8 
 
 ipc:
   host: 127.0.0.1

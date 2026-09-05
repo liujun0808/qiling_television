@@ -1,6 +1,0 @@
-{"time_unix_ns": 1788486834185355034, "event": "rollout_io_started"}
-{"time_unix_ns": 1788486834185415927, "event": "bridge_started", "mode": "shadow", "config": "/home/ub/program/qiling_television/src/qiling_rollout_ros/config/rollout_host.yaml"}
-{"time_unix_ns": 1788486834205520679, "event": "command_blocked", "reason": "stale_or_missing_state"}
-{"time_unix_ns": 1788486835205665560, "event": "command_blocked", "reason": "stale_or_missing_state"}
-{"time_unix_ns": 1788486836225696979, "event": "command_blocked", "reason": "stale_or_missing_state"}
-{"time_unix_ns": 1788486836863410907, "event": "bridge_stopped"}

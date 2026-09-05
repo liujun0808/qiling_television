@@ -23,8 +23,32 @@ import yaml
 
 def as_numpy(value: Any) -> np.ndarray:
     if isinstance(value, torch.Tensor):
-        return value.detach().cpu().numpy()
+        # NumPy has no bfloat16 dtype; XVLA is configured for bfloat16 on CUDA.
+        # Convert only at the IPC boundary, after the saved postprocessor has
+        # restored the physical action scale.
+        return value.detach().float().cpu().numpy()
     return np.asarray(value)
+
+
+def image_hwc_to_chw_uint8(image: np.ndarray, name: str) -> torch.Tensor:
+    """Convert one bridge RGB frame to the checkpoint processor input format.
+
+    The saved LeRobot ``to_batch_processor`` intentionally only batches Torch
+    tensors.  Supplying an HWC NumPy frame therefore leaves it as ``[H,W,C]``
+    and ImageNet normalization interprets the width as the channel dimension.
+    Keep the frame uint8 here; the saved XVLA processor performs its own
+    uint8-to-float conversion, normalization, CUDA transfer, and batching.
+    """
+    array = np.asarray(image)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError(f"{name} must be an HWC RGB frame with 3 channels, got {array.shape}")
+    if array.dtype != np.uint8:
+        if not np.issubdtype(array.dtype, np.integer):
+            raise ValueError(f"{name} must use integer RGB values in [0,255], got {array.dtype}")
+        if array.min() < 0 or array.max() > 255:
+            raise ValueError(f"{name} values must be in [0,255]")
+        array = array.astype(np.uint8, copy=False)
+    return torch.from_numpy(np.ascontiguousarray(array)).permute(2, 0, 1).contiguous()
 
 
 class XVLAWorker:
@@ -69,13 +93,17 @@ class XVLAWorker:
 
     def infer(self, observation: dict[str, Any]) -> tuple[np.ndarray, float]:
         images = observation["images"]
+        right_q = np.asarray(observation["right_q"], dtype=np.float32)
+        if right_q.shape != (7,) or not np.all(np.isfinite(right_q)):
+            raise ValueError(f"right_q must contain 7 finite joint positions, got {right_q.shape}")
         raw_observation = {
             # Keep source names: saved checkpoint preprocessor performs the training rename map.
-            "observation.images.head": np.ascontiguousarray(images["head"]),
-            "observation.images.left": np.ascontiguousarray(images["left"]),
-            "observation.images.right": np.ascontiguousarray(images["right"]),
-            # Training observation.state is right-arm q(7), not velocity or action.
-            "observation.state": np.asarray(observation["right_q"], dtype=np.float32),
+            "observation.images.head": image_hwc_to_chw_uint8(images["head"], "head image"),
+            "observation.images.left": image_hwc_to_chw_uint8(images["left"], "left image"),
+            "observation.images.right": image_hwc_to_chw_uint8(images["right"], "right image"),
+            # Training observation.state is right-arm q(7), not velocity or action. The saved
+            # XVLA model pads this vector internally to its 20-D proprio representation.
+            "observation.state": torch.from_numpy(np.ascontiguousarray(right_q)),
             "task": self.task,
         }
         start = time.perf_counter()
