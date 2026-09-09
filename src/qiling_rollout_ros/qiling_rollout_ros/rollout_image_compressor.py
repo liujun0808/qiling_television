@@ -8,9 +8,10 @@ import time
 import cv2
 from cv_bridge import CvBridge, CvBridgeError
 import rclpy
-from rclpy.executors import ExternalShutdownException
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, Image
 
 
@@ -48,6 +49,21 @@ class RolloutImageCompressor(Node):
             raise RuntimeError("jpeg_quality must be in [1, 100]")
 
         self._bridge = CvBridge()
+        # RealSense publishes these raw streams as RELIABLE.  A depth-one
+        # reliable reader avoids retaining stale full-resolution frames while
+        # matching the camera writer exactly.  Compressed frames are also
+        # reliable because a dropped DDS fragment invalidates the whole JPEG.
+        self._image_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        # Serialise callbacks from one camera while allowing the three cameras
+        # to encode concurrently in the multi-threaded executor.
+        self._image_callback_groups = {
+            name: MutuallyExclusiveCallbackGroup() for name in defaults
+        }
         self._last_publish = {name: float("-inf") for name in defaults}
         self._received = {name: 0 for name in defaults}
         self._published = {name: 0 for name in defaults}
@@ -57,12 +73,13 @@ class RolloutImageCompressor(Node):
             input_topic = str(self.get_parameter(f"{name}_input_topic").value)
             output_topic = str(self.get_parameter(f"{name}_output_topic").value)
             self._image_publishers[name] = self.create_publisher(
-                CompressedImage, output_topic, qos_profile_sensor_data)
+                CompressedImage, output_topic, self._image_qos)
             self._image_subscriptions.append(self.create_subscription(
                 Image,
                 input_topic,
                 self._make_callback(name),
-                qos_profile_sensor_data,
+                self._image_qos,
+                callback_group=self._image_callback_groups[name],
             ))
             self.get_logger().info(f"{name}: {input_topic} -> {output_topic}")
 
@@ -113,12 +130,15 @@ class RolloutImageCompressor(Node):
 def main() -> None:
     rclpy.init()
     node = RolloutImageCompressor()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         try:
+            executor.shutdown()
             node.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
-set -Eeuo pipefail
+# ROS 2 Humble's generated setup files probe variables that may be unset.
+# Enable nounset only after both environment scripts have been sourced.
+set -Eeo pipefail
 
 # Start the three local RealSense RGB streams first, then start the rollout
 # JPEG transport after a fixed warm-up delay. Keep this script in the
@@ -29,6 +31,7 @@ fi
 source "${ROS_SETUP}"
 # shellcheck disable=SC1090
 source "${WORKSPACE_SETUP}"
+set -u
 
 camera_launch_pid=""
 compressor_launch_pid=""

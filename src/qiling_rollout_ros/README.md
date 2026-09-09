@@ -77,7 +77,9 @@ home/过渡点、关节限位、MIT `kp/kd`、Pinocchio 重力前馈、O6 位置
 
 真机侧相机节点仍以 `640×480 @ 30 Hz` 发布 raw 图像，`rollout_image_compressor` 默认只向主机发送
 `15 Hz、JPEG quality=80` 的三路 `CompressedImage`。这样不改变相机采集配置，也避免三路未压缩 RGB
-占满 Wi-Fi。raw 和压缩话题名称、压缩质量及输出频率均可通过 launch 参数或节点参数调整。
+占满 Wi-Fi。raw 接收和压缩图像传输均使用 `RELIABLE + KEEP_LAST(depth=1)`；三路编码由多线程 executor
+处理，既与 RealSense 的 reliable 发布端一致，也避免丢失一个 DDS 分片就丢掉整幅 JPEG。raw 和压缩
+话题名称、压缩质量及输出频率均可通过 launch 参数或节点参数调整。
 
 该包不启动 `topic_convertor`，也不运行 Quest、XR bridge 或 differential IK；这些命令源必须与 rollout
 互斥，避免多个发布者同时写入 `/human_lower_command`。

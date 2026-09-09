@@ -26,7 +26,13 @@ from mit_msgs.msg import MITJointCommand, MITJointCommands, MITLowState
 from qi.msg import HandsCmd
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import CompressedImage, Image
 from std_srvs.srv import Trigger
 import yaml
@@ -247,8 +253,18 @@ class RolloutRosBridge(Node):
             return
         topics = self.config["topics"]
         image_type = CompressedImage if self.image_message_type == "compressed" else Image
+        image_qos = (
+            QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+            if self.image_message_type == "compressed"
+            else qos_profile_sensor_data
+        )
         self._image_subs = [
-            self.create_subscription(image_type, str(topics[key]), self._image_callback(name), qos_profile_sensor_data)
+            self.create_subscription(image_type, str(topics[key]), self._image_callback(name), image_qos)
             for name, key in (("head", "head_image"), ("left", "left_image"), ("right", "right_image"))
         ]
         self._ipc_listener = Listener((self.ipc_host, self.ipc_port), authkey=self.ipc_authkey)
