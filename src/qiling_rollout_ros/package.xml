@@ -15,8 +15,13 @@
   <exec_depend>mit_msgs</exec_depend>
   <exec_depend>qi</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

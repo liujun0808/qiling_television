@@ -9,7 +9,7 @@ environment:
 dataset:
   # 本地 LeRobot v3 数据集。
   repo_id: local/qiling_right_arm_o6_v2
-  root: /home/ub/program/qiling_television/lerobot_dataset_v2
+  root: /home/ub/program/qiling_television/lerobot_dataset_all_episodes_v1
   # 必须使用 pyav；当前 torchcodec 无法加载 FFmpeg。
   video_backend: pyav
   # 将本机器人相机名称映射为 XVLA 预训练权重固定使用的三个视觉输入名称。
@@ -43,11 +43,11 @@ training:
   job_name: qiling_right_arm_o6_xvla_v2_full_ft
   seed: 1000
   # 显存不足时首先降低 batch_size。
-  batch_size: 4
-  num_workers: 4
+  batch_size: 8
+  num_workers: 16
   steps: 200000
   log_freq: 200
-  save_freq: 20000
+  save_freq: 40000
   eval_freq: 50000
   save_checkpoint: true
   learning_rate: 0.0001

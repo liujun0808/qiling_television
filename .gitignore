@@ -17,6 +17,10 @@ CMakeUserPresets.json
 /lerobot_dataset_v2
 /training/cache
 /training/outputs
+/conversion_runs
+/lerobot_dataset_all_episodes_v1
+/rollout/logs
+/rollout/records
 # CLion
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

@@ -9,7 +9,10 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
-        ("share/" + package_name + "/launch", ["launch/rollout_host.launch.py"]),
+        ("share/" + package_name + "/launch", [
+            "launch/rollout_host.launch.py",
+            "launch/rollout_image_transport.launch.py",
+        ]),
         ("share/" + package_name + "/config", ["config/rollout_host.yaml"]),
         ("share/" + package_name, ["README.md"]),
     ],
@@ -22,6 +25,7 @@ setup(
     entry_points={
         "console_scripts": [
             "rollout_ros_bridge = qiling_rollout_ros.rollout_ros_bridge:main",
+            "rollout_image_compressor = qiling_rollout_ros.rollout_image_compressor:main",
         ],
     },
 )

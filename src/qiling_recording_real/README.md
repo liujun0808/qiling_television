@@ -127,11 +127,12 @@ ros2 topic pub --once /recording/language std_msgs/msg/String \
 
 ## 转换为 LeRobot
 
-当前转换链路只保留两阶段实现：
+当前模式是**完整 episode 一对一转换**：每条通过结构检查的原始 episode 对应一条
+LeRobot episode，不抽取可用片段，不因图像时间间隔而拆分 episode。
 
 ```text
 成功 episode MCAP
-  ↓ build_training_admission_manifest.py（生成可用连续片段清单）
+  ↓ build_training_admission_manifest.py（结构检查，生成完整 episode 清单）
   ↓ export_manifest_to_intermediate.py（ROS Python 3.10）
 intermediate：JPEG + q/dq/q_target/O6 标签
   ↓ pack_intermediate_to_lerobot.py（lerobot051 Python 3.12）
@@ -141,6 +142,270 @@ LeRobot v3 数据集
 `export_manifest_to_intermediate.py` 是唯一读取 MCAP/ROS bag 的转换阶段；
 `pack_intermediate_to_lerobot.py` 是唯一依赖 LeRobot 的打包阶段。旧的历史双臂直转脚本与已废弃的
 人工 review/promotion 脚本已删除，避免被误用于当前右臂 + O6 数据结构。
+
+以头部相机第一帧到最后一帧为时间范围，保留头部帧，其他相机、状态与 action 按最近时间戳
+对齐。当前导出器的 `--camera-tolerance-sec` 和 `--state-tolerance-sec` 仅为兼容参数，不执行
+超差丢帧。最近帧对齐不能修复源数据丢帧。缺必需 topic、空流、数据损坏等结构问题仍会拒绝整条
+episode。JSON 中沿用 `training_segments` / `segment_id` 字段名，每项实际代表完整 episode。
+
+### 选择模式：从指定 episode 开始连续 N 条
+
+“往下 20 个”定义为：按目录名中的录制时间升序排列，从指定 episode **本身开始计数**，取连续
+20 条；不是按文件管理器当前显示顺序或文件修改时间排列。时间不连续、跨录制批次也照常计数。
+
+下面的选择命令只创建软链接，不复制或修改原始 MCAP。仅选择正式的 `episode_YYYYMMDD_HHMMSS_mmm`
+目录，不选择 `.pending`。起点不存在、不足指定条数或选择内目录缺失元数据时直接报错，不会悄悄
+少选或用后面的条目补位。
+
+先在主机终端设置本次转换参数（后续命令在同一终端按顺序执行）：
+
+```bash
+cd /home/ub/program/qiling_television
+# 在系统 ROS Python 环境中执行前两阶段，勿使用 Conda Python 读取 MCAP。
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+export CONVERT_START=episode_20260904_214028_679
+export CONVERT_COUNT=20
+# 每次转换使用新的工作目录与数据集目录，避免覆盖先前结果。
+export CONVERT_WORK="$PWD/conversion_runs/from_214028_20"
+export CONVERT_OUTPUT="$PWD/lerobot_dataset_from_214028_20"
+export CONVERT_REPO_ID=local/qiling_right_arm_o6_from_214028_20
+```
+
+创建选择目录并打印所选的 20 条名单：
+
+```bash
+/usr/bin/python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+root = Path('recordings').resolve()
+start = os.environ['CONVERT_START']
+count = int(os.environ['CONVERT_COUNT'])
+work = Path(os.environ['CONVERT_WORK'])
+if count <= 0:
+    raise SystemExit('CONVERT_COUNT 必须大于 0')
+episodes = sorted(
+    (p for p in root.iterdir()
+     if p.is_dir() and re.fullmatch(r'episode_\d{8}_\d{6}_\d{3}', p.name)),
+    key=lambda p: p.name,
+)
+names = [p.name for p in episodes]
+if start not in names:
+    raise SystemExit(f'找不到起始 episode：{start}')
+offset = names.index(start)
+selected = episodes[offset:offset + count]
+if len(selected) != count:
+    raise SystemExit(f'从 {start} 起只有 {len(selected)} 条，需要 {count} 条')
+for p in selected:
+    if not (p / 'session.yaml').is_file() or not (p / 'rosbag').is_dir():
+        raise SystemExit(f'episode 结构不完整：{p}')
+if work.exists():
+    raise SystemExit(f'工作目录已存在，请更换 CONVERT_WORK：{work}')
+inputs = work / 'input'
+inputs.mkdir(parents=True)
+for number, p in enumerate(selected, 1):
+    (inputs / p.name).symlink_to(p, target_is_directory=True)
+    print(f'{number:02d}. {p.name}')
+print(f'已选择 {len(selected)} 条，选择目录：{inputs}')
+PY
+```
+
+选择失败时先修正参数，不要继续后续步骤。以后选其他批次，只修改 `CONVERT_START`、
+`CONVERT_COUNT` 和三个输出标识即可。选择目录创建后名单已经固定，后续新录制的 episode 不会自动加入。
+
+### 第一步：生成完整 episode 清单
+
+```bash
+/usr/bin/python3 \
+  src/qiling_recording_real/scripts/build_training_admission_manifest.py \
+  "$CONVERT_WORK/input" \
+  --config-file src/qiling_recording_real/config/real_recording.yaml \
+  --output "$CONVERT_WORK/manifest.json"
+```
+
+检查生成的 `manifest.md` / `manifest.json`。下面的命令确认指定的 N 条均通过检查，每条只有一个
+完整导出项；若不通过，应先处理错误，不能把“选了 20 条”当作“成功转换了 20 条”：
+
+```bash
+/usr/bin/python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+m = json.loads((Path(os.environ['CONVERT_WORK']) / 'manifest.json').read_text())
+n = int(os.environ['CONVERT_COUNT'])
+items = m['training_segments']
+assert len(items) == n, f'要求 {n} 条，实际通过 {len(items)} 条；请查看 manifest.md'
+assert len({s['source_episode'] for s in items}) == n, '检测到重复 episode'
+assert all(e['tier'] == 'all_recorded' and len(e['segments']) == 1 for e in m['episodes'])
+print(f'确认 {n} 条完整 episode 可以导出')
+PY
+```
+
+### 第二步：导出 MCAP 为中间文件
+
+```bash
+/usr/bin/python3 \
+  src/qiling_recording_real/scripts/export_manifest_to_intermediate.py \
+  "$CONVERT_WORK/manifest.json" \
+  --output-root "$CONVERT_WORK/intermediate"
+```
+
+输出为每条 episode 的 JPEG、`data.npz` 和来源信息；原始 recordings 不变。
+
+### 第三步：使用 lerobot051 打包 LeRobot v3
+
+```bash
+/home/ub/miniconda3/envs/lerobot051/bin/python \
+  src/qiling_recording_real/scripts/pack_intermediate_to_lerobot.py \
+  "$CONVERT_WORK/intermediate" \
+  --output-root "$CONVERT_OUTPUT" \
+  --repo-id "$CONVERT_REPO_ID" \
+  --fps 30
+```
+
+不需要编译，也不需要启动 SDK、相机、遥操或 rollout。`--repo-id` 用作数据集标识，这条命令
+仅写入本地，不上传。两个转换脚本都拒绝覆盖已存在的输出目录；重跑请使用新的输出路径。
+
+最终包含三路视频、右臂 `observation.state(7)`、`observation.velocity(7)` 和
+`action(8) = 右臂目标关节角(7) + O6 开闭目标(1)`。检查实际输出条数：
+
+```bash
+/usr/bin/python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+info = json.loads((Path(os.environ['CONVERT_OUTPUT']) / 'meta/info.json').read_text())
+print('episodes:', info['total_episodes'], 'frames:', info['total_frames'], 'fps:', info['fps'])
+assert info['total_episodes'] == int(os.environ['CONVERT_COUNT'])
+PY
+```
+
+### 全量模式：转换 `recordings/` 中全部完整 episode
+
+先停止录制，且在下列命令执行期间不要新建 episode。本模式直接扫描 `recordings/` 下所有名称符合
+`episode_YYYYMMDD_HHMMSS_mmm` 的目录，不创建软链接；每条原始 episode 仍是一条 LeRobot
+episode。它不会覆盖前述“从指定 episode 开始”的转换结果。
+
+“全部”指当前右臂 + O6 数据格式下所有**成功且结构完整**的 episode。若存在未保存、失败、缺少
+必需 topic、JPEG 损坏或旧数据格式的条目，清单检查会在核对步骤中明确报出并停止，避免静默漏转。
+先修复或移走这些无效条目，再重新执行全量转换。
+
+```bash
+cd /home/ub/program/qiling_television
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+# 改为新的名字即可重做一次全量转换；不要使用已经存在的目录。
+export ALL_CONVERT_WORK="$PWD/conversion_runs/all_episodes_v1"
+export ALL_CONVERT_OUTPUT="$PWD/lerobot_dataset_all_episodes_v1"
+export ALL_CONVERT_REPO_ID=local/qiling_right_arm_o6_all_episodes_v1
+
+if [ -e "$ALL_CONVERT_WORK" ] || [ -e "$ALL_CONVERT_OUTPUT" ]; then
+  echo '全量工作目录或输出数据集目录已存在；请改用新的 *_vN 名字。' >&2
+  exit 1
+fi
+mkdir -p "$ALL_CONVERT_WORK"
+
+# 仅计数正式 episode 目录；.pending 和其他辅助文件不会参与转换。
+export ALL_SOURCE_COUNT="$(/usr/bin/python3 - <<'PY'
+import re
+from pathlib import Path
+
+pattern = re.compile(r'episode_\d{8}_\d{6}_\d{3}')
+root = Path('recordings')
+print(sum(p.is_dir() and pattern.fullmatch(p.name) is not None for p in root.iterdir()))
+PY
+)"
+if [ "$ALL_SOURCE_COUNT" -le 0 ]; then
+  echo 'recordings/ 下没有可转换的正式 episode。' >&2
+  exit 1
+fi
+echo "本次将检查并转换 $ALL_SOURCE_COUNT 条 episode"
+```
+
+第一步生成全量清单：
+
+```bash
+/usr/bin/python3 \
+  src/qiling_recording_real/scripts/build_training_admission_manifest.py \
+  recordings \
+  --config-file src/qiling_recording_real/config/real_recording.yaml \
+  --output "$ALL_CONVERT_WORK/manifest.json"
+```
+
+必须进行下面的核对。它要求 `recordings/` 中的每条正式 episode 都恰好生成一条完整导出项；若打印
+拒绝条目，先查看 `"$ALL_CONVERT_WORK/manifest.md"` 的原因并处理，不要直接继续打包：
+
+```bash
+/usr/bin/python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest = json.loads((Path(os.environ['ALL_CONVERT_WORK']) / 'manifest.json').read_text())
+expected = int(os.environ['ALL_SOURCE_COUNT'])
+episodes = manifest['episodes']
+segments = manifest['training_segments']
+rejected = [
+    f"{item['source_episode']}: {', '.join(item.get('reasons', []))}"
+    for item in episodes if item['tier'] != 'all_recorded'
+]
+if rejected:
+    raise SystemExit(
+        '以下 episode 不能按当前完整 episode 规则转换：\n- '
+        + '\n- '.join(rejected)
+        + '\n请查看 manifest.md 后处理，再重新运行。')
+assert len(episodes) == expected, (len(episodes), expected)
+assert len(segments) == expected, (len(segments), expected)
+assert len({item['source_episode'] for item in segments}) == expected
+assert all(item['tier'] == 'all_recorded' and len(item['segments']) == 1 for item in episodes)
+print(f'确认 {expected} 条完整 episode 均可导出')
+PY
+```
+
+第二步导出 MCAP，第三步打包为 LeRobot v3：
+
+```bash
+/usr/bin/python3 \
+  src/qiling_recording_real/scripts/export_manifest_to_intermediate.py \
+  "$ALL_CONVERT_WORK/manifest.json" \
+  --output-root "$ALL_CONVERT_WORK/intermediate"
+
+/home/ub/miniconda3/envs/lerobot051/bin/python \
+  src/qiling_recording_real/scripts/pack_intermediate_to_lerobot.py \
+  "$ALL_CONVERT_WORK/intermediate" \
+  --output-root "$ALL_CONVERT_OUTPUT" \
+  --repo-id "$ALL_CONVERT_REPO_ID" \
+  --fps 30
+```
+
+完成后检查数据集实际条数：
+
+```bash
+/usr/bin/python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+info = json.loads((Path(os.environ['ALL_CONVERT_OUTPUT']) / 'meta/info.json').read_text())
+expected = int(os.environ['ALL_SOURCE_COUNT'])
+print('episodes:', info['total_episodes'], 'frames:', info['total_frames'], 'fps:', info['fps'])
+assert info['total_episodes'] == expected, (info['total_episodes'], expected)
+PY
+```
+
+### 其他选择方式
+
+- 指定单条：使用相同流程，将 `CONVERT_START` 设为该条名字、`CONVERT_COUNT=1`。
+- 指定连续多条：使用上面的起始名字 + 条数模式。
+- 全量：使用上面的“全量模式”整套命令；它会动态计数并要求每条源 episode 都被完整转换。
+- 不连续的几条：在新的 `CONVERT_WORK/input` 里仅放入所需 episode 的绝对路径软链接，再执行
+  三个阶段；将 `CONVERT_COUNT` 改为实际选择数量。
 
 ## 注意事项
 

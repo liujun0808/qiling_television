@@ -13,7 +13,8 @@ def load_rgb(p):
     if x is None: raise RuntimeError(f"cannot decode {p}")
     return cv2.cvtColor(x,cv2.COLOR_BGR2RGB)
 def main():
-    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument("intermediate_root"); ap.add_argument("--output-root",required=True); ap.add_argument("--repo-id",default="local/qiling_right_arm_o6"); ap.add_argument("--fps",type=float,default=30.0); a=ap.parse_args()
+    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument("intermediate_root"); ap.add_argument("--output-root",required=True); ap.add_argument("--repo-id",default="local/qiling_right_arm_o6"); ap.add_argument("--fps",type=int,default=30,help="Integer video frame rate; the current recording format is 30."); a=ap.parse_args()
+    if a.fps <= 0: raise ValueError("--fps must be a positive integer")
     inp=Path(a.intermediate_root); out=Path(a.output_root)
     if out.exists(): raise RuntimeError(f"output exists: {out}")
     entries=json.loads((inp/"index.json").read_text(encoding="utf-8"))["episodes"]

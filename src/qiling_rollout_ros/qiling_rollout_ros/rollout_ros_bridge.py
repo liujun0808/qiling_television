@@ -10,8 +10,6 @@ MIT/DDS command path.
 
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass
 from datetime import datetime
 import json
 from multiprocessing.connection import Listener
@@ -20,6 +18,7 @@ import threading
 import time
 from typing import Any
 
+import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge, CvBridgeError
@@ -28,19 +27,19 @@ from qi.msg import HandsCmd
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from std_srvs.srv import Trigger
 import yaml
+
+from qiling_rollout_ros.async_action_scheduler import LatencyAwareActionScheduler
+from qiling_rollout_ros.reference_limiter import (
+    AccelerationLimitedJointReference,
+    interpolate_scheduled_targets,
+)
 
 
 ARM_DOF = 7
 FINGER_DOF = 6
-
-
-@dataclass
-class TimedAction:
-    due_monotonic: float
-    values: np.ndarray
 
 
 class RolloutRosBridge(Node):
@@ -67,6 +66,11 @@ class RolloutRosBridge(Node):
             raise RuntimeError("execution mode must be shadow or armed")
         self.command_period = 1.0 / max(1.0, float(execution["command_rate_hz"]))
         self.policy_action_period = 1.0 / max(1.0, float(execution["policy_action_rate_hz"]))
+        self.policy_execution_horizon_steps = int(execution["policy_execution_horizon_steps"])
+        self.policy_prefetch_watermark_steps = int(execution["policy_prefetch_watermark_steps"])
+        self.max_inference_latency_steps = int(execution["max_inference_latency_steps"])
+        self.policy_protected_prefix_steps = int(execution.get("policy_protected_prefix_steps", 3))
+        self.policy_blend_steps = int(execution.get("policy_blend_steps", 4))
         self.state_timeout = max(0.02, float(execution["state_timeout_sec"]))
         self.image_timeout = max(0.02, float(execution["image_timeout_sec"]))
         self.action_timeout = max(0.02, float(execution["action_timeout_sec"]))
@@ -82,6 +86,9 @@ class RolloutRosBridge(Node):
         self.max_rollout_duration = max(0.0, float(execution.get("max_rollout_duration_sec", 0.0)))
 
         topics = self.config["topics"]
+        self.image_message_type = str(topics.get("image_message_type", "raw")).strip().lower()
+        if self.image_message_type not in {"raw", "compressed"}:
+            raise RuntimeError("topics.image_message_type must be raw or compressed")
         robot = self.config["robot"]
         self.body_motor_count = int(robot["body_motor_count"])
         self.leg_offset = int(robot["leg_offset"])
@@ -102,6 +109,10 @@ class RolloutRosBridge(Node):
             raise RuntimeError("joint limit margin leaves no valid right-arm range")
         self.right_max_velocity = self._vector(
             robot["right_max_velocity_rad_s"], ARM_DOF, "right_max_velocity_rad_s")
+        self.right_max_acceleration = self._vector(
+            robot["right_max_acceleration_rad_s2"], ARM_DOF, "right_max_acceleration_rad_s2")
+        if np.any(self.right_max_velocity <= 0.0) or np.any(self.right_max_acceleration <= 0.0):
+            raise RuntimeError("right-arm maximum velocity and acceleration must be positive")
         self.command_kp = float(robot["command_kp"])
         self.command_kd = float(robot["command_kd"])
 
@@ -157,8 +168,24 @@ class RolloutRosBridge(Node):
         self._latest_images: dict[str, tuple[np.ndarray, float]] = {}
         self._latest_state: tuple[np.ndarray, np.ndarray, float] | None = None
         self._right_reference: np.ndarray | None = None
+        self._right_reference_limiter = AccelerationLimitedJointReference(
+            lower=self.right_lower,
+            upper=self.right_upper,
+            max_velocity=self.right_max_velocity,
+            max_acceleration=self.right_max_acceleration,
+        )
+        self._last_reference_update_monotonic: float | None = None
+        self._last_policy_action = None
         self._last_action_time: float | None = None
-        self._action_queue: deque[TimedAction] = deque()
+        self._action_scheduler = LatencyAwareActionScheduler(
+            action_period_sec=self.policy_action_period,
+            execution_horizon_steps=self.policy_execution_horizon_steps,
+            prefetch_watermark_steps=self.policy_prefetch_watermark_steps,
+            max_inference_latency_steps=self.max_inference_latency_steps,
+            protected_prefix_steps=self.policy_protected_prefix_steps,
+            blend_steps=self.policy_blend_steps,
+            action_dimension=8,
+        )
         self._right_o6_closed = False
         self._last_published_o6: bool | None = None
         self._worker_connected = False
@@ -219,8 +246,9 @@ class RolloutRosBridge(Node):
         if self._rollout_io_active:
             return
         topics = self.config["topics"]
+        image_type = CompressedImage if self.image_message_type == "compressed" else Image
         self._image_subs = [
-            self.create_subscription(Image, str(topics[key]), self._image_callback(name), qos_profile_sensor_data)
+            self.create_subscription(image_type, str(topics[key]), self._image_callback(name), qos_profile_sensor_data)
             for name, key in (("head", "head_image"), ("left", "left_image"), ("right", "right_image"))
         ]
         self._ipc_listener = Listener((self.ipc_host, self.ipc_port), authkey=self.ipc_authkey)
@@ -241,7 +269,7 @@ class RolloutRosBridge(Node):
             self._state_sub = None
         with self._lock:
             self._latest_images.clear()
-            self._action_queue.clear()
+            self._action_scheduler.clear()
         self._rollout_io_active = False
         self._event("rollout_io_stopped")
 
@@ -265,13 +293,16 @@ class RolloutRosBridge(Node):
             self._log_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def _image_callback(self, name: str):
-        def callback(message: Image) -> None:
+        def callback(message: Image | CompressedImage) -> None:
             try:
-                image = self._cv_bridge.imgmsg_to_cv2(message, desired_encoding="rgb8")
+                if isinstance(message, CompressedImage):
+                    image = self._cv_bridge.compressed_imgmsg_to_cv2(message, desired_encoding="rgb8")
+                else:
+                    image = self._cv_bridge.imgmsg_to_cv2(message, desired_encoding="rgb8")
                 image = np.ascontiguousarray(image)
                 if image.ndim != 3 or image.shape[2] != 3:
                     raise ValueError(f"expected HWC RGB image, got {image.shape}")
-            except (CvBridgeError, ValueError) as error:
+            except (CvBridgeError, ValueError, cv2.error) as error:
                 self.get_logger().error(f"{name} image conversion failed: {error}")
                 return
             with self._lock:
@@ -292,7 +323,7 @@ class RolloutRosBridge(Node):
         with self._lock:
             self._latest_state = (positions, velocities, time.monotonic())
             if self._right_reference is None:
-                self._right_reference = positions[self.right_offset:self.right_offset + ARM_DOF].copy()
+                self._reset_right_reference(positions[self.right_offset:self.right_offset + ARM_DOF])
 
     def _snapshot_observation(self) -> dict[str, Any]:
         now = time.monotonic()
@@ -303,6 +334,13 @@ class RolloutRosBridge(Node):
                 return {"type": "observation", "status": "finished", "reason": "rollout_aborted"}
             if not self._rollout_io_active or self._phase not in {"SHADOW_ROLLOUT", "ROLLOUT"}:
                 return {"type": "observation", "status": "not_ready", "reason": f"phase_{self._phase.lower()}"}
+            if not self._action_scheduler.should_request_inference():
+                return {
+                    "type": "observation",
+                    "status": "not_ready",
+                    "reason": "action_buffered" if not self._action_scheduler.inference_in_flight else "inference_in_flight",
+                    "queued_actions": self._action_scheduler.queue_size,
+                }
             if self._latest_state is None:
                 return {"type": "observation", "status": "not_ready", "reason": "missing_state"}
             positions, _, state_time = self._latest_state
@@ -318,10 +356,13 @@ class RolloutRosBridge(Node):
                     return {"type": "observation", "status": "not_ready", "reason": f"stale_{name}_image"}
                 images[name] = image.copy()
             right_q = positions[self.right_offset:self.right_offset + ARM_DOF].copy()
+            inference_request = self._action_scheduler.begin_inference_request(now)
         return {
             "type": "observation",
             "status": "ready",
-            "sent_monotonic": now,
+            "request_id": inference_request.request_id,
+            "observation_monotonic": inference_request.observation_monotonic,
+            "queued_actions_at_request": inference_request.queued_actions,
             "images": images,
             # This is exactly the training observation.state: right-arm q(7), in radians.
             "right_q": right_q,
@@ -330,25 +371,55 @@ class RolloutRosBridge(Node):
     def _accept_action_chunk(self, message: dict[str, Any]) -> dict[str, Any]:
         if self._phase not in {"SHADOW_ROLLOUT", "ROLLOUT"}:
             return {"type": "ack", "ok": False, "reason": f"rollout_not_active:{self._phase}"}
-        actions = np.asarray(message.get("actions", []), dtype=np.float64)
-        if actions.ndim != 2 or actions.shape[1] != 8 or actions.shape[0] == 0:
+        try:
+            request_id = int(message["request_id"])
+            actions = np.asarray(message["actions"], dtype=np.float64)
+            model_latency = float(message.get("inference_latency_ms", -1.0))
+            worker_completed = float(message["inference_completed_monotonic"])
+        except (KeyError, TypeError, ValueError) as error:
             self._worker_errors += 1
-            return {"type": "ack", "ok": False, "reason": "expected non-empty [N,8] actions"}
-        if not np.all(np.isfinite(actions)):
-            self._worker_errors += 1
-            return {"type": "ack", "ok": False, "reason": "non-finite action"}
-        model_latency = float(message.get("inference_latency_ms", -1.0))
+            return {"type": "ack", "ok": False, "reason": f"malformed action chunk: {error}"}
         now = time.monotonic()
         with self._lock:
-            self._action_queue.clear()
-            for index, action in enumerate(actions):
-                self._action_queue.append(TimedAction(now + index * self.policy_action_period, action.copy()))
-            self._last_action_time = now
-            self._worker_last_action_latency_ms = model_latency if model_latency >= 0.0 else None
+            try:
+                admission = self._action_scheduler.admit_chunk(
+                    request_id=request_id, actions=actions, arrival_monotonic=now)
+            except ValueError as error:
+                pending = self._action_scheduler.pending_request
+                if pending is not None and pending.request_id == request_id:
+                    self._action_scheduler.cancel_pending_request(request_id)
+                self._worker_errors += 1
+                return {"type": "ack", "ok": False, "reason": str(error)}
+            self._last_action_time = now if admission.scheduled_steps else self._last_action_time
+            self._worker_last_action_latency_ms = model_latency if np.isfinite(model_latency) and model_latency >= 0.0 else None
         self._event(
-            "action_chunk_received", count=int(actions.shape[0]),
-            inference_latency_ms=model_latency, first_action=actions[0].tolist())
-        return {"type": "ack", "ok": True, "accepted": int(actions.shape[0])}
+            "action_chunk_received",
+            request_id=request_id,
+            returned_steps=int(actions.shape[0]),
+            scheduled_steps=admission.scheduled_steps,
+            queue_before=admission.queue_before,
+            queue_after=admission.queue_after,
+            protected_steps=admission.protected_steps,
+            replaced_steps=admission.replaced_steps,
+            blended_steps=admission.blended_steps,
+            latency_ms=round(admission.latency_sec * 1000.0, 3),
+            latency_steps=admission.latency_steps,
+            first_model_step=admission.first_model_step,
+            inference_latency_ms=model_latency,
+            worker_completed_monotonic=worker_completed,
+            first_scheduled_due_monotonic=admission.first_due_monotonic,
+        )
+        return {
+            "type": "ack",
+            "ok": True,
+            "accepted": admission.scheduled_steps,
+            "returned_steps": int(actions.shape[0]),
+            "latency_steps": admission.latency_steps,
+            "first_model_step": admission.first_model_step,
+            "protected_steps": admission.protected_steps,
+            "replaced_steps": admission.replaced_steps,
+            "blended_steps": admission.blended_steps,
+        }
 
     def _ipc_server_loop(self) -> None:
         while self._running:
@@ -371,6 +442,9 @@ class RolloutRosBridge(Node):
                     elif kind == "worker_error":
                         self._worker_errors += 1
                         reason = str(request.get("reason", "unknown worker error"))
+                        request_id = request.get("request_id")
+                        with self._lock:
+                            self._action_scheduler.cancel_pending_request(request_id)
                         self._event("worker_error", reason=reason)
                         connection.send({"type": "ack", "ok": True})
                     else:
@@ -385,6 +459,7 @@ class RolloutRosBridge(Node):
             finally:
                 with self._lock:
                     self._worker_connected = False
+                    self._action_scheduler.cancel_pending_request()
                 if connection is not None:
                     try:
                         connection.close()
@@ -407,10 +482,9 @@ class RolloutRosBridge(Node):
             return response
         with self._lock:
             state = self._latest_state
-            self._action_queue.clear()
+            self._action_scheduler.clear()
             self._last_action_time = None
-            if hasattr(self, "_desired_right"):
-                del self._desired_right
+            self._last_policy_action = None
         now = time.monotonic()
         if state is None or now - state[2] > self.state_timeout:
             response.success = False
@@ -419,7 +493,8 @@ class RolloutRosBridge(Node):
         positions, _, _ = state
         self._phase_start_left = positions[self.left_offset:self.left_offset + ARM_DOF].copy()
         self._phase_start_right = positions[self.right_offset:self.right_offset + ARM_DOF].copy()
-        self._right_reference = self._phase_start_right.copy()
+        with self._lock:
+            self._reset_right_reference(self._phase_start_right)
         self._set_phase("RETURN_DIRECT_TO_HOME", "finish service requested")
         response.success = True
         response.message = "worker actions stopped; returning both arms directly to home"
@@ -428,13 +503,13 @@ class RolloutRosBridge(Node):
     def _begin_abort(self, positions: np.ndarray, reason: str) -> None:
         """Latch the physical pose and stop model I/O without moving the arms."""
         with self._lock:
-            self._action_queue.clear()
+            self._action_scheduler.clear()
             self._last_action_time = None
-            if hasattr(self, "_desired_right"):
-                del self._desired_right
+            self._last_policy_action = None
         self._abort_hold_left = positions[self.left_offset:self.left_offset + ARM_DOF].copy()
         self._abort_hold_right = positions[self.right_offset:self.right_offset + ARM_DOF].copy()
-        self._right_reference = self._abort_hold_right.copy()
+        with self._lock:
+            self._reset_right_reference(self._abort_hold_right)
         self._deactivate_rollout_io(stop_state_subscription=False)
         self._set_phase("ABORT_HOLD", reason)
 
@@ -464,20 +539,60 @@ class RolloutRosBridge(Node):
         response.message = "model I/O stopped; both arms hold their abort-time measured pose"
         return response
 
-    def _next_target(self, now: float, measured_right: np.ndarray) -> tuple[np.ndarray, bool]:
-        """Consume due model actions and return a bounded desired target."""
+    def _reset_right_reference(self, position: np.ndarray) -> None:
+        """Synchronise the 50 Hz limiter whenever an external safe motion takes over."""
+        self._right_reference = self._right_reference_limiter.reset(position)
+        self._last_reference_update_monotonic = None
+
+    def _next_interpolated_target(self, now: float) -> tuple[np.ndarray | None, bool]:
+        """Return the 30 Hz policy target interpolated at this 50 Hz timestamp.
+
+        Only two actions that have passed scheduler admission may be used.  If
+        there is no later queued action, no policy trajectory is extrapolated:
+        the reference limiter receives ``None`` and safely holds its current
+        position until a new verified pair of targets is available.
+        """
         action_used = False
         with self._lock:
-            while self._action_queue and self._action_queue[0].due_monotonic <= now:
-                action = self._action_queue.popleft().values
+            for timed_action in self._action_scheduler.pop_due(now):
+                action = timed_action.values
                 self._right_o6_closed = self._o6_state_from_value(float(action[7]), self._right_o6_closed)
-                desired = action[:ARM_DOF]
-                self._desired_right = desired.copy()
+                self._last_policy_action = timed_action
                 action_used = True
             fresh = self._last_action_time is not None and now - self._last_action_time <= self.action_timeout
-            desired = getattr(self, "_desired_right", measured_right).copy() if fresh else measured_right.copy()
-        desired = np.clip(desired, self.right_lower, self.right_upper)
-        return desired, action_used
+            previous = self._last_policy_action
+            following = self._action_scheduler.peek_next()
+            if not fresh or previous is None or following is None:
+                return None, action_used
+            try:
+                target = interpolate_scheduled_targets(
+                    previous.due_monotonic,
+                    previous.values[:ARM_DOF],
+                    following.due_monotonic,
+                    following.values[:ARM_DOF],
+                    now,
+                )
+            except ValueError as error:
+                self._worker_errors += 1
+                self._event("invalid_scheduled_interpolation", reason=str(error))
+                return None, action_used
+        return np.clip(target, self.right_lower, self.right_upper), action_used
+
+    def _advance_right_reference(self, now: float, target: np.ndarray | None, measured_right: np.ndarray) -> np.ndarray:
+        """Convert an interpolated 30 Hz policy target into one safe 50 Hz q_ref."""
+        with self._lock:
+            if self._right_reference is None:
+                self._reset_right_reference(measured_right)
+            if self._last_reference_update_monotonic is None:
+                dt = self.command_period
+            else:
+                # A delayed timer must not create a proportionally larger
+                # position step; a very early callback uses its real shorter
+                # elapsed time, preserving physical velocity limits.
+                dt = min(self.command_period, max(1.0e-4, now - self._last_reference_update_monotonic))
+            self._last_reference_update_monotonic = now
+            self._right_reference = self._right_reference_limiter.step(target, dt)
+            return self._right_reference.copy()
 
     def _o6_state_from_value(self, value: float, previous: bool) -> bool:
         if value >= self.o6_close_threshold:
@@ -570,7 +685,9 @@ class RolloutRosBridge(Node):
     def _enter_startup_motion(self, measured_left: np.ndarray, measured_right: np.ndarray) -> None:
         self._phase_start_left = measured_left.copy()
         self._phase_start_right = measured_right.copy()
-        self._right_reference = self._phase_start_right.copy()
+        with self._lock:
+            self._reset_right_reference(self._phase_start_right)
+            self._last_policy_action = None
         self._right_o6_closed = False
         self._set_phase("MOVE_TO_TRANSITION", "fresh robot state received")
         # Home uses the neutral O6 state; the physical adapter maps this to its
@@ -594,7 +711,9 @@ class RolloutRosBridge(Node):
             elif now - self._settled_since >= self.home_settle_duration:
                 self._set_phase(next_phase, reason)
                 if next_phase == "ROLLOUT":
-                    self._right_reference = self.right_home.copy()
+                    with self._lock:
+                        self._reset_right_reference(self.right_home)
+                        self._last_policy_action = None
                     self._activate_rollout_io()
         else:
             self._settled_since = None
@@ -642,7 +761,9 @@ class RolloutRosBridge(Node):
         if phase == "WAIT_BEFORE_ROLLOUT":
             if now - self._phase_started >= self.rollout_start_delay:
                 self._set_phase("ROLLOUT", "home delay elapsed; starting observation and inference")
-                self._right_reference = self.right_home.copy()
+                with self._lock:
+                    self._reset_right_reference(self.right_home)
+                    self._last_policy_action = None
                 self._activate_rollout_io()
             return self.left_home, self.right_home
         if phase == "RETURN_DIRECT_TO_HOME":
@@ -682,6 +803,7 @@ class RolloutRosBridge(Node):
         positions, _, _ = state
         measured_left = positions[self.left_offset:self.left_offset + ARM_DOF].copy()
         measured_right = positions[self.right_offset:self.right_offset + ARM_DOF].copy()
+        self._last_block_reason = "ready"
 
         if self._phase == "ABORT_HOLD":
             assert self._abort_hold_left is not None and self._abort_hold_right is not None
@@ -711,18 +833,19 @@ class RolloutRosBridge(Node):
             self._publish_body_command(
                 positions, self._abort_hold_left, self._abort_hold_right, apply_gravity=True)
             return
-        desired_right, action_used = self._next_target(now, measured_right)
+        interpolated_target, action_used = self._next_interpolated_target(now)
+        right_reference = self._advance_right_reference(now, interpolated_target, measured_right)
         with self._lock:
-            if self._right_reference is None:
-                self._right_reference = measured_right.copy()
-            max_step = self.right_max_velocity * self.command_period
-            self._right_reference += np.clip(desired_right - self._right_reference, -max_step, max_step)
-            right_reference = self._right_reference.copy()
             right_o6_closed = self._right_o6_closed
 
         if self.execution_mode == "shadow":
             if action_used:
-                self._event("shadow_candidate", right_target=right_reference.tolist(), right_o6_closed=right_o6_closed)
+                self._event(
+                    "shadow_candidate",
+                    right_target=right_reference.tolist(),
+                    interpolated_policy_target=None if interpolated_target is None else interpolated_target.tolist(),
+                    right_o6_closed=right_o6_closed,
+                )
             return
 
         self._publish_body_command(positions, self.left_home, right_reference, apply_gravity=True)
@@ -744,12 +867,14 @@ class RolloutRosBridge(Node):
                 for name, data in self._latest_images.items()
             }
             state_age = None if self._latest_state is None else round(now - self._latest_state[2], 3)
-            queue_size = len(self._action_queue)
+            queue_size = self._action_scheduler.queue_size
+            inference_in_flight = self._action_scheduler.inference_in_flight
             worker_connected = self._worker_connected
             latency = self._worker_last_action_latency_ms
         self.get_logger().info(
             f"mode={self.execution_mode} phase={self._phase} worker={worker_connected} state_age={state_age} "
-            f"image_age={image_age} queued_actions={queue_size} inference_ms={latency} "
+            f"image_age={image_age} queued_actions={queue_size} inference_in_flight={inference_in_flight} "
+            f"inference_ms={latency} "
             f"blocked={self._last_block_reason}")
 
     def destroy_node(self) -> bool:

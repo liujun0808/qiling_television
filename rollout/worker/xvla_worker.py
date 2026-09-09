@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Python 3.12 XVLA inference worker for the host-side rollout bridge.
 
-No ROS package is imported here.  The worker obtains the newest RGB/q
-observation from localhost, runs the exact pre/postprocessors saved beside the
-checkpoint, and returns the first configured action steps of the XVLA chunk.
+No ROS package is imported here. The bridge decides when the action buffer
+needs replenishing; the worker then runs the saved XVLA preprocessors and
+returns the model's complete physical-scale action chunk with its timestamps.
 """
 
 from __future__ import annotations
@@ -65,7 +65,8 @@ class XVLAWorker:
         self.task = str(model_config["task"]).strip()
         if not self.task:
             raise RuntimeError("model.task must be non-empty")
-        self.action_steps = max(1, int(model_config["action_steps_to_send"]))
+        self.warmup_enabled = bool(model_config.get("warmup_enabled", True))
+        self.warmup_iterations = max(0, int(model_config.get("warmup_iterations", 1)))
         ipc = self.config["ipc"]
         self.address = (str(ipc["host"]), int(ipc["port"]))
         if self.address[0] not in {"127.0.0.1", "localhost", "::1"}:
@@ -88,8 +89,36 @@ class XVLAWorker:
         self.policy.reset()
         print(
             f"XVLA worker ready: device={self.policy.config.device}, "
-            f"chunk={self.policy.config.chunk_size}, send_steps={self.action_steps}",
+            f"chunk={self.policy.config.chunk_size}, returning full chunks to bridge",
             flush=True)
+        if self.warmup_enabled and self.warmup_iterations:
+            self._warmup()
+
+    def _warmup(self) -> None:
+        """Compile/initialize the complete deployed inference path before IPC.
+
+        The first CUDA invocation is materially slower than steady-state XVLA
+        inference. Warm up after model loading but before connecting to the
+        bridge, so the first robot observation does not consume that latency.
+        """
+        synthetic_observation = {
+            "images": {
+                name: np.zeros((480, 640, 3), dtype=np.uint8)
+                for name in ("head", "left", "right")
+            },
+            "right_q": np.zeros(7, dtype=np.float32),
+        }
+        for iteration in range(self.warmup_iterations):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _, latency_ms = self.infer(synthetic_observation)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(
+                f"XVLA warm-up {iteration + 1}/{self.warmup_iterations}: "
+                f"{latency_ms:.1f} ms",
+                flush=True)
+        self.policy.reset()
 
     def infer(self, observation: dict[str, Any]) -> tuple[np.ndarray, float]:
         images = observation["images"]
@@ -110,7 +139,7 @@ class XVLAWorker:
         batch = self.preprocessor(raw_observation)
         with torch.inference_mode():
             chunk = self.policy.predict_action_chunk(batch)
-        steps = min(self.action_steps, int(chunk.shape[1]))
+        steps = int(chunk.shape[1])
         actions: list[np.ndarray] = []
         for index in range(steps):
             action = self.postprocessor(chunk[:, index])
@@ -139,23 +168,38 @@ class XVLAWorker:
                         time.sleep(self.not_ready_delay)
                         continue
                     try:
+                        request_id = int(reply["request_id"])
+                        observation_monotonic = float(reply["observation_monotonic"])
+                        inference_started_monotonic = time.monotonic()
                         actions, latency_ms = self.infer(reply)
+                        inference_completed_monotonic = time.monotonic()
                         connection.send({
                             "type": "action_chunk",
+                            "request_id": request_id,
+                            "observation_monotonic": observation_monotonic,
                             "actions": actions,
                             "inference_latency_ms": latency_ms,
+                            "inference_started_monotonic": inference_started_monotonic,
+                            "inference_completed_monotonic": inference_completed_monotonic,
                         })
                         ack = connection.recv()
                         if not ack.get("ok", False):
                             print(f"Bridge rejected action: {ack}", flush=True)
                         else:
                             print(
-                                f"XVLA action chunk accepted: {ack.get('accepted')} steps, "
+                                f"XVLA chunk returned={ack.get('returned_steps')} "
+                                f"scheduled={ack.get('accepted')} "
+                                f"model_start={ack.get('first_model_step')} "
+                                f"latency_steps={ack.get('latency_steps')} "
                                 f"inference={latency_ms:.1f} ms", flush=True)
                     except Exception as error:
                         detail = "".join(traceback.format_exception_only(type(error), error)).strip()
                         print(f"XVLA inference error: {detail}", flush=True)
-                        connection.send({"type": "worker_error", "reason": detail})
+                        connection.send({
+                            "type": "worker_error",
+                            "request_id": reply.get("request_id"),
+                            "reason": detail,
+                        })
                         connection.recv()
                         time.sleep(self.retry_delay)
             except KeyboardInterrupt:
