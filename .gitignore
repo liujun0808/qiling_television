@@ -5,7 +5,7 @@ lerobot_dataset_all_episodes_v1
 log
 qiling_release
 recordings
-rollout
+/rollout
 /training/
 /src/qiling_rollout_ros/
 # CLion
