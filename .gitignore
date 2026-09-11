@@ -1,26 +1,13 @@
-CMakeLists.txt.user
-CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
-Makefile
-cmake_install.cmake
-install_manifest.txt
-compile_commands.json
-CTestTestfile.cmake
-_deps
-CMakeUserPresets.json
-/build
-/install
-/log
-/recordings
-/lerobot_dataset_v2
-/training/cache
-/training/outputs
-/conversion_runs
-/lerobot_dataset_all_episodes_v1
-/rollout/logs
-/rollout/records
+build
+conversion_runs
+install
+lerobot_dataset_all_episodes_v1
+log
+qiling_release
+recordings
+rollout
+src/qiling_rollout_ros
+training
 # CLion
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
